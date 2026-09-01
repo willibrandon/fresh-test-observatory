@@ -30,8 +30,6 @@
     "check-types": "node scripts/sync-fresh-types.mjs --check",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "docs:build": "vitepress build docs",
-    "docs:dev": "vitepress dev docs",
     "typecheck": "tsc -p tsconfig.json && tsc -p tests/tsconfig.json",
     "check-plugin": "fresh --check-plugin fresh-test-observatory.ts",
     "validate": "npm run format:check && npm run typecheck && npm test && npm run check-plugin"
@@ -39,7 +37,6 @@
   "devDependencies": {
     "@types/node": "^24.0.0",
     "prettier": "^3.9.6",
-    "typescript": "^7.0.2",
-    "vitepress": "^1.6.4"
+    "typescript": "^7.0.2"
   }
 }

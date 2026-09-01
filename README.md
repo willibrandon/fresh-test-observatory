@@ -6,7 +6,7 @@ Rust projects use cargo-nextest when it is installed and fall back to Cargo. Go 
 
 Test commands run only in trusted workspaces. Reports are written to Fresh's temporary directory by default. Editing a covered file clears its old line data.
 
-Language plugins can register their own discovery, execution, and result parsing through the typed registerAdapter API. The guide and API reference are at https://willibrandon.github.io/fresh-test-observatory/.
+Language plugins can register their own discovery, execution, and result parsing through the typed registerAdapter API exported by the plugin.
 
 Development requires Fresh 0.4.10 or newer and Node 24 or newer.
 
