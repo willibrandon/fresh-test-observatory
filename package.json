@@ -1,5 +1,5 @@
 {
-  "$schema": "https://fresh-editor.dev/schemas/package.schema.json",
+  "$schema": "https://raw.githubusercontent.com/sinelaw/fresh/main/crates/fresh-editor/plugins/schemas/package.schema.json",
   "name": "fresh-test-observatory",
   "version": "0.1.0",
   "description": "Test discovery, execution, failure navigation, and coverage for Fresh",
@@ -7,7 +7,7 @@
   "author": "Brandon Williams",
   "license": "MIT",
   "repository": "https://github.com/willibrandon/fresh-test-observatory",
-  "homepage": "https://willibrandon.github.io/fresh-test-observatory/",
+  "homepage": "https://github.com/willibrandon/fresh-test-observatory",
   "keywords": [
     "fresh-editor",
     "testing",

@@ -203,3 +203,30 @@ test("controller can disable adapters without removing their registrations", asy
   controller.setEnabledAdapters([]);
   assert.equal(await controller.refresh(), 1);
 });
+
+test("controller routes progress, trust, and empty-selection messages through its translation port", async () => {
+  const progress: string[] = [];
+  const restrictedPort = port("restricted");
+  restrictedPort.translate = (key, params = {}) =>
+    `localized:${key}:${Object.values(params).join("|")}`;
+  restrictedPort.progress = (message) => progress.push(message);
+  const restricted = new TestObservatoryController(restrictedPort, [adapter()]);
+
+  await restricted.refresh();
+  await restricted.run("workspace");
+
+  assert.ok(progress.some((message) => message.startsWith("localized:controller.discovering:")));
+  assert.ok(
+    progress.some((message) =>
+      message.startsWith("localized:controller.discovering_adapter:Fake|1|1"),
+    ),
+  );
+  assert.deepEqual(restricted.snapshot().diagnostics, ["localized:controller.trust_run:"]);
+
+  const trustedPort = port("trusted");
+  trustedPort.translate = (key) => `localized:${key}`;
+  const trusted = new TestObservatoryController(trustedPort, [adapter()]);
+  await trusted.refresh();
+  await trusted.run("selected");
+  assert.deepEqual(trusted.snapshot().diagnostics, ["localized:controller.no_selected"]);
+});

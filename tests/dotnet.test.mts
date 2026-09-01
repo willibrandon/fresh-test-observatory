@@ -129,7 +129,7 @@ public class Outer
   }
 }`;
   const [result] = discoverDotnetSourceTests("/repo/tests/NestedTests.cs", source, detected);
-  assert.equal(result?.nativeId, "Demo.Tests.Outer.Inner.Adds");
+  assert.equal(result?.nativeId, "Demo.Tests.Outer+Inner.Adds");
   assert.deepEqual(result?.suite, ["App.Tests", "Demo.Tests", "Outer", "Inner"]);
 });
 

@@ -196,6 +196,45 @@ test("coverage details describe markers for a covered current file", () => {
   ]);
 });
 
+test("run and coverage presentation use the supplied message formatter", () => {
+  const seen: string[] = [];
+  const translate = (key: string, params: Readonly<Record<string, string>> = {}): string => {
+    seen.push(key);
+    return `${key}:${Object.values(params).join("|")}`;
+  };
+
+  const summary = summarizeTests([sample("pass", "passed")]);
+  assert.deepEqual(formatRunSummary(summary, translate), [
+    "run.complete:",
+    "run.counts:1|0|0",
+    "run.one_test:1",
+  ]);
+  assert.deepEqual(
+    formatCoverageDetails(
+      [{ path: "/repo/a.ts", lines: [{ line: 1, hits: 1 }] }],
+      "/repo/a.ts",
+      translate,
+    ),
+    [
+      "coverage.summary:1|1|100",
+      "coverage.one_file:1",
+      "coverage.current:1|1|100",
+      "coverage.legend:",
+      "coverage.explorer:",
+    ],
+  );
+  assert.deepEqual(seen, [
+    "run.complete",
+    "run.counts",
+    "run.one_test",
+    "coverage.summary",
+    "coverage.one_file",
+    "coverage.current",
+    "coverage.legend",
+    "coverage.explorer",
+  ]);
+});
+
 test("treeSelectionAt clears the displayed test when a branch node is selected", () => {
   const rows = buildTestTree([sample("Suite.Case", "passed")]);
   const branchIndex = rows.findIndex((row) => !row.testId);

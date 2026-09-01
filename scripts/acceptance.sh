@@ -31,6 +31,24 @@ hex1b keys "$terminal_id" --key Enter
 hex1b assert "$terminal_id" --text-present "Test Observatory discovered 14 tests" --timeout 60
 hex1b capture screenshot "$terminal_id" --format png --output "$artifact_root/discovered.png"
 
+hex1b keys "$terminal_id" --key p --ctrl
+hex1b keys "$terminal_id" --text "Test Observatory: Run Nearest in Terminal"
+hex1b keys "$terminal_id" --key Enter
+hex1b assert "$terminal_id" --text-present "(exited)" --timeout 60
+hex1b capture screenshot "$terminal_id" --format png --output "$artifact_root/terminal-nearest.png"
+
+hex1b keys "$terminal_id" --key p --ctrl
+hex1b keys "$terminal_id" --text "Test Observatory: Show Output"
+hex1b keys "$terminal_id" --key Enter
+hex1b assert "$terminal_id" --text-present "test result: ok" --timeout 60
+hex1b capture screenshot "$terminal_id" --format png --output "$artifact_root/terminal-output-panel.png"
+
+hex1b keys "$terminal_id" --key p --ctrl
+hex1b keys "$terminal_id" --text "Test Observatory: Open"
+hex1b keys "$terminal_id" --key Enter
+hex1b capture screenshot "$terminal_id" --format png --output "$artifact_root/after-terminal.png"
+hex1b assert "$terminal_id" --text-present "1 passed, 0 failed, 0 skipped" --timeout 60
+
 hex1b keys "$terminal_id" --text "n"
 hex1b assert "$terminal_id" --text-present "1 passed, 0 failed, 0 skipped" --timeout 60
 hex1b capture screenshot "$terminal_id" --format png --output "$artifact_root/nearest.png"

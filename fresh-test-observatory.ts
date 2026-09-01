@@ -36,6 +36,12 @@ import {
   resolvePath,
 } from "./lib/path.ts";
 import {
+  beginDirtySourceSession,
+  dockStructureFingerprint,
+  endDirtySourceSession,
+  terminalProcessOutput,
+} from "./lib/runtime.ts";
+import {
   button,
   col,
   divider,
@@ -84,7 +90,8 @@ interface PersistedUiState {
 }
 
 interface TerminalWaiter {
-  output: string;
+  bufferId: number;
+  fallbackLines: string[];
   resolve(output: ProcessOutput): void;
 }
 
@@ -136,7 +143,9 @@ let manualOutput = "";
 let activeProcess: ProcessHandle<SpawnResult> | undefined;
 let activeTerminalId: number | undefined;
 let terminalRunActive = false;
-let lastBusy = false;
+let lastDockStructure = "";
+let lastStatusBarText = "";
+const statusBarBuffers = new Set<number>();
 let lastSourceLocation: { path?: string; line?: number } = {};
 const discoveryCache = new Map<string, string[]>();
 const openBufferText = new Map<string, string>();
@@ -165,6 +174,7 @@ const controller = new TestObservatoryController(
     },
     changed: onControllerChanged,
     cancelActiveProcess,
+    translate,
   },
   createBuiltInAdapters(),
 );
@@ -201,6 +211,10 @@ const publicApi: TestObservatoryApi = {
 
 editor.exportPluginApi("fresh-test-observatory", publicApi);
 editor.registerStatusBarElement(STATUS_TOKEN, "Tests");
+
+function translate(key: string, params: Readonly<Record<string, string>> = {}): string {
+  return editor.t(key, params);
+}
 
 function defineSettings(): Settings {
   return {
@@ -323,6 +337,7 @@ async function runScope(scope: TestScope): Promise<TestSummary> {
     selectedTestId = focused;
     selectedTreeKey = "test:" + focused;
   }
+  renderDock();
   editor.setStatus(formatStatusSummary(summary));
   if (summary.failed > 0 && settings.autoOpenOnFailure) await openDock();
   persistUiState();
@@ -586,7 +601,11 @@ async function executeInTerminal(spec: ProcessSpec): Promise<ProcessOutput> {
   });
   activeTerminalId = terminal.terminalId;
   return new Promise<ProcessOutput>((resolve) => {
-    terminalWaiters.set(terminal.terminalId, { output: "", resolve });
+    terminalWaiters.set(terminal.terminalId, {
+      bufferId: terminal.bufferId,
+      fallbackLines: [],
+      resolve,
+    });
   });
 }
 
@@ -654,11 +673,7 @@ function activeLocation(): { path?: string; line?: number } {
 
 function onControllerChanged(): void {
   const snapshot = controller.snapshot();
-  if (lastBusy && !snapshot.busy) {
-    void paintDecorations();
-  }
-  lastBusy = snapshot.busy;
-  renderDock();
+  if (!mutateDock(snapshot)) renderDock();
   updateStatusBar();
 }
 
@@ -730,7 +745,54 @@ function closeDock(): void {
 
 function renderDock(): void {
   if (!dockOpen || dockBufferId === undefined || !panelMounted) return;
+  const snapshot = controller.snapshot();
   editor.updateWidgetPanel(PANEL_ID, showOutput ? outputSpec() : dockSpec());
+  lastDockStructure = currentDockStructure(snapshot);
+}
+
+function mutateDock(snapshot: ObservatorySnapshot): boolean {
+  if (
+    !dockOpen ||
+    dockBufferId === undefined ||
+    !panelMounted ||
+    currentDockStructure(snapshot) !== lastDockStructure
+  ) {
+    return false;
+  }
+  if (showOutput) {
+    const entries = outputEntries();
+    return editor.widgetMutate(PANEL_ID, {
+      kind: "setItems",
+      widgetKey: OUTPUT_KEY,
+      items: entries,
+      itemKeys: entries.map((_, index) => `${OUTPUT_KEY}:${index}`),
+    });
+  }
+  const titleUpdated = editor.widgetMutate(PANEL_ID, {
+    kind: "setRawEntries",
+    widgetKey: "title",
+    entries: [{ text: dockTitle(snapshot), style: { bold: true } }],
+  });
+  const detailsUpdated = editor.widgetMutate(PANEL_ID, {
+    kind: "setRawEntries",
+    widgetKey: "details",
+    entries: detailEntries(snapshot),
+  });
+  return titleUpdated && detailsUpdated;
+}
+
+function currentDockStructure(snapshot: ObservatorySnapshot): string {
+  return dockStructureFingerprint({
+    tests: snapshot.tests,
+    busy: snapshot.busy,
+    showOutput,
+    coverageVisible,
+    ...(selectedTestId ? { selectedTestId } : {}),
+    ...(selectedTreeKey ? { selectedTreeKey } : {}),
+    filter: filterText,
+    failedOnly,
+    sortMode,
+  });
 }
 
 function dockSpec(): ObservatoryWidgetSpec {
@@ -740,10 +802,6 @@ function dockSpec(): ObservatoryWidgetSpec {
   const resolvedExpansion = resolveExpandedTreeKeys(treeRows, treeExpansionMode, expandedTreeKeys);
   expandedTreeKeys = new Set(resolvedExpansion);
   const workspaceSummary = summarizeTests(snapshot.tests);
-  const summary = controller.currentSummary();
-  const title = snapshot.busy
-    ? "◉ " + snapshot.progress + " · " + plural(summary.total, "test", "tests")
-    : titleSummary(snapshot, summary, workspaceSummary);
   const controls = wrappingRow(
     button(editor.t("button.refresh"), "refresh", { disabled: snapshot.busy }),
     button(editor.t("button.run_all"), "run-workspace", {
@@ -808,7 +866,7 @@ function dockSpec(): ObservatoryWidgetSpec {
           "empty",
         );
   return col(
-    raw([{ text: title, style: { bold: true } }], "title"),
+    raw([{ text: dockTitle(snapshot), style: { bold: true } }], "title"),
     controls,
     treeControls,
     divider(),
@@ -825,8 +883,7 @@ function dockSpec(): ObservatoryWidgetSpec {
 }
 
 function outputSpec(): ObservatoryWidgetSpec {
-  const lines = outputText().split(/\r?\n/);
-  const entries = lines.map((text) => ({ text }));
+  const entries = outputEntries();
   return col(
     raw([{ text: editor.t("panel.output"), style: { bold: true } }], "output-title"),
     wrappingRow(
@@ -836,12 +893,31 @@ function outputSpec(): ObservatoryWidgetSpec {
       button(editor.t("button.adapters"), "adapters"),
     ),
     divider(),
-    list(entries.length > 0 ? entries : [{ text: editor.t("panel.no_output") }], OUTPUT_KEY),
+    list(entries, OUTPUT_KEY),
     hintBar([
       { keys: "c", label: editor.t("hint.copy") },
       { keys: "q", label: editor.t("hint.back") },
     ]),
   );
+}
+
+function outputEntries(): TextPropertyEntry[] {
+  const output = outputText();
+  return output
+    ? output.split(/\r?\n/).map((text) => ({ text }))
+    : [{ text: editor.t("panel.no_output") }];
+}
+
+function dockTitle(snapshot: ObservatorySnapshot): string {
+  const summary = controller.currentSummary();
+  return snapshot.busy
+    ? "◉ " +
+        snapshot.progress +
+        " · " +
+        editor.t(summary.total === 1 ? "panel.one_test" : "panel.many_tests", {
+          count: String(summary.total),
+        })
+    : titleSummary(snapshot, summary, summarizeTests(snapshot.tests));
 }
 
 function filteredTests(snapshot: ObservatorySnapshot): TestCase[] {
@@ -873,7 +949,7 @@ function toWidgetNode(value: TestTreeRow): ObservatoryTreeNode {
 function detailEntries(snapshot: ObservatorySnapshot): TextPropertyEntry[] {
   const entries: TextPropertyEntry[] = [];
   if (coverageDetailsVisible || lastOperationWasCoverage) {
-    for (const text of formatCoverageDetails(snapshot.coverage, activeLocation().path)) {
+    for (const text of formatCoverageDetails(snapshot.coverage, activeLocation().path, translate)) {
       entries.push({ text });
     }
   } else {
@@ -899,7 +975,9 @@ function detailEntries(snapshot: ObservatorySnapshot): TextPropertyEntry[] {
     } else if (snapshot.busy) {
       entries.push({ text: snapshot.progress || editor.t("panel.running") });
     } else if (lastRunScope && snapshot.summaryTestIds) {
-      entries.push(...formatRunSummary(controller.currentSummary()).map((text) => ({ text })));
+      entries.push(
+        ...formatRunSummary(controller.currentSummary(), translate).map((text) => ({ text })),
+      );
     } else if (editor.workspaceTrustLevel() !== "trusted") {
       entries.push({ text: editor.t("panel.trust_required") });
     } else {
@@ -1102,30 +1180,17 @@ async function paintDecorations(): Promise<void> {
   updateStatusBar();
 }
 
-async function paintTestState(): Promise<void> {
-  const snapshot = controller.snapshot();
-  const root = editor.getCwd();
-  const testsByPath = new Map<string, TestCase[]>();
-  for (const test of snapshot.tests) {
-    if (!test.source) continue;
-    const path = resolvePath(root, test.source.path);
-    if (dirtySourcePaths.has(pathKey(path))) continue;
-    const items = testsByPath.get(pathKey(path)) ?? [];
-    items.push({ ...test, source: { ...test.source, path } });
-    testsByPath.set(pathKey(path), items);
-  }
-  const explorer = [...testsByPath.values()].map((tests) => {
-    const status = worstStatus(tests.map((test) => test.status));
-    return {
-      path: tests[0]!.source!.path,
-      symbol: statusGlyph(status),
-      color: statusTheme(status),
-      priority: 30,
-    };
-  });
-  editor.setFileExplorerDecorations(TEST_NAMESPACE, explorer);
+async function paintTestState(bufferIds?: ReadonlySet<number>): Promise<void> {
+  const testsByPath = testStateByPath();
+  paintTestExplorerDecorations(testsByPath);
   for (const buffer of editor.listBuffers()) {
-    if (!buffer.path || buffer.is_virtual) continue;
+    if (
+      !buffer.path ||
+      buffer.is_virtual ||
+      (bufferIds !== undefined && !bufferIds.has(buffer.id))
+    ) {
+      continue;
+    }
     editor.clearLineIndicators(buffer.id, TEST_NAMESPACE);
     editor.removeVirtualTextsByPrefix(buffer.id, FAILURE_TEXT_PREFIX);
     const tests = testsByPath.get(pathKey(buffer.path));
@@ -1173,6 +1238,34 @@ async function paintTestState(): Promise<void> {
   }
 }
 
+function testStateByPath(): Map<string, TestCase[]> {
+  const snapshot = controller.snapshot();
+  const root = editor.getCwd();
+  const testsByPath = new Map<string, TestCase[]>();
+  for (const test of snapshot.tests) {
+    if (!test.source) continue;
+    const path = resolvePath(root, test.source.path);
+    if (dirtySourcePaths.has(pathKey(path))) continue;
+    const items = testsByPath.get(pathKey(path)) ?? [];
+    items.push({ ...test, source: { ...test.source, path } });
+    testsByPath.set(pathKey(path), items);
+  }
+  return testsByPath;
+}
+
+function paintTestExplorerDecorations(testsByPath: ReadonlyMap<string, TestCase[]>): void {
+  const explorer = [...testsByPath.values()].map((tests) => {
+    const status = worstStatus(tests.map((test) => test.status));
+    return {
+      path: tests[0]!.source!.path,
+      symbol: statusGlyph(status),
+      color: statusTheme(status),
+      priority: 30,
+    };
+  });
+  editor.setFileExplorerDecorations(TEST_NAMESPACE, explorer);
+}
+
 async function paintCoverage(): Promise<void> {
   const files = controller.snapshot().coverage;
   const root = editor.getCwd();
@@ -1209,6 +1302,13 @@ async function paintCoverage(): Promise<void> {
       contiguousCoverageMarkers(file, ranges),
     );
   }
+  paintCoverageExplorerDecorations(files, root);
+}
+
+function paintCoverageExplorerDecorations(
+  files: readonly CoverageFile[],
+  root = editor.getCwd(),
+): void {
   editor.setFileExplorerDecorations(
     COVERAGE_NAMESPACE,
     files.map((file) => {
@@ -1285,11 +1385,15 @@ function lineByteRanges(
 function invalidateDecorations(bufferId: number): void {
   const path = editor.getBufferPath(bufferId);
   if (!path) return;
-  dirtySourcePaths.add(pathKey(path));
+  if (
+    !beginDirtySourceSession(dirtySourcePaths, pathKey(path), editor.isBufferModified(bufferId))
+  ) {
+    return;
+  }
   discoveryCache.clear();
   editor.clearLineIndicators(bufferId, TEST_NAMESPACE);
   editor.removeVirtualTextsByPrefix(bufferId, FAILURE_TEXT_PREFIX);
-  void paintTestState();
+  paintTestExplorerDecorations(testStateByPath());
   if (coverageVisible && !invalidatedCoverageBuffers.has(bufferId)) {
     invalidatedCoverageBuffers.add(bufferId);
     controller.invalidateCoveragePath(path);
@@ -1298,8 +1402,10 @@ function invalidateDecorations(bufferId: number): void {
     if (controller.snapshot().coverage.length === 0) {
       coverageVisible = false;
       editor.clearFileExplorerDecorations(COVERAGE_NAMESPACE);
+      renderDock();
+      updateStatusBar();
     } else {
-      void paintCoverage();
+      paintCoverageExplorerDecorations(controller.snapshot().coverage);
     }
     editor.setStatus(editor.t("status.coverage_stale"));
   }
@@ -1324,15 +1430,27 @@ function updateStatusBar(): void {
     : "";
   const text =
     prefix + " ✓" + summary.passed + " ✕" + summary.failed + " ○" + summary.skipped + coverage;
-  for (const buffer of editor.listBuffers()) {
+  const buffers = editor.listBuffers();
+  if (text === lastStatusBarText) {
+    for (const buffer of buffers) {
+      if (statusBarBuffers.has(buffer.id)) continue;
+      editor.setStatusBarValue(buffer.id, STATUS_TOKEN, text);
+      statusBarBuffers.add(buffer.id);
+    }
+    return;
+  }
+  lastStatusBarText = text;
+  statusBarBuffers.clear();
+  for (const buffer of buffers) {
     editor.setStatusBarValue(buffer.id, STATUS_TOKEN, text);
+    statusBarBuffers.add(buffer.id);
   }
 }
 
 async function runSavedFile(path: string): Promise<void> {
   if (controller.snapshot().busy) return;
   await prepareOpenBufferText();
-  dirtySourcePaths.delete(pathKey(path));
+  endDirtySourceSession(dirtySourcePaths, pathKey(path));
   discoveryCache.clear();
   if (!controller.snapshot().discoveryRoot) await controller.refresh();
   const active = { activeFile: path, activeLine: 1 };
@@ -1418,10 +1536,6 @@ function formatStatusSummary(summary: TestSummary): string {
     failed: String(summary.failed),
     skipped: String(summary.skipped),
   });
-}
-
-function plural(count: number, singular: string, multiple: string): string {
-  return count + " " + (count === 1 ? singular : multiple);
 }
 
 function errorMessage(error: unknown): string {
@@ -1708,36 +1822,48 @@ editor.on("widget_event", (event) => {
 
 editor.on("terminal_output", (event) => {
   const waiter = terminalWaiters.get(event.terminal_id);
-  if (waiter) waiter.output += event.last_line + "\n";
+  if (!waiter) return;
+  if (waiter.fallbackLines.at(-1) !== event.last_line) {
+    waiter.fallbackLines.push(event.last_line);
+    if (waiter.fallbackLines.length > 10_000) waiter.fallbackLines.shift();
+  }
 });
 
 editor.on("terminal_exit", (event) => {
-  const waiter = terminalWaiters.get(event.terminal_id);
-  if (!waiter) return;
-  terminalWaiters.delete(event.terminal_id);
-  if (activeTerminalId === event.terminal_id) activeTerminalId = undefined;
-  waiter.resolve({
-    stdout: waiter.output,
-    stderr: "",
-    exitCode: event.exit_code ?? -1,
-  });
+  void finishTerminalRun(event.terminal_id, event.exit_code);
 });
 
-editor.on("after_insert", (event) => invalidateDecorations(event.buffer_id));
-editor.on("after_delete", (event) => invalidateDecorations(event.buffer_id));
+async function finishTerminalRun(terminalId: number, exitCode: number | null): Promise<void> {
+  const waiter = terminalWaiters.get(terminalId);
+  if (!waiter) return;
+  terminalWaiters.delete(terminalId);
+  if (activeTerminalId === terminalId) activeTerminalId = undefined;
+  let transcript: string | undefined;
+  try {
+    transcript = await editor.getBufferText(waiter.bufferId);
+  } catch {
+    // The terminal can be closed before its final buffer snapshot is available.
+  }
+  waiter.resolve(terminalProcessOutput(transcript, waiter.fallbackLines, exitCode));
+}
+
+editor.on("lines_changed", (event) => invalidateDecorations(event.buffer_id));
 
 editor.on("after_file_save", (event) => {
   discoveryCache.clear();
   openBufferText.delete(pathKey(event.path));
+  const wasDirty = endDirtySourceSession(dirtySourcePaths, pathKey(event.path));
   if (watchEnabled || settings.coverageOnSave) {
     void guardedCall(() => runSavedFile(event.path));
+  } else if (wasDirty) {
+    void guardedCall(() => paintTestState(new Set([event.buffer_id])));
   }
 });
 
 editor.on("after_file_revert", (event) => {
   discoveryCache.clear();
   openBufferText.delete(pathKey(event.path));
-  dirtySourcePaths.delete(pathKey(event.path));
+  endDirtySourceSession(dirtySourcePaths, pathKey(event.path));
   invalidatedCoverageBuffers.delete(event.buffer_id);
   if (dockOpen && !controller.snapshot().busy) void guardedCall(refreshTests);
 });
@@ -1755,6 +1881,7 @@ editor.on("buffer_activated", () => {
 
 editor.on("buffer_closed", (event) => {
   invalidatedCoverageBuffers.delete(event.buffer_id);
+  statusBarBuffers.delete(event.buffer_id);
   if (event.buffer_id !== dockBufferId) return;
   dockBufferId = undefined;
   dockSplitId = undefined;

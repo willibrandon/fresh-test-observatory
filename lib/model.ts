@@ -34,6 +34,8 @@ export interface CoverageSummary {
   percent: number;
 }
 
+export type MessageFormatter = (key: string, params?: Readonly<Record<string, string>>) => string;
+
 export type TreeExpansionMode = "all" | "none" | "manual";
 export type TestSortMode = "name" | "duration";
 
@@ -130,16 +132,38 @@ export function summarizeTestsForIds(
 }
 
 /** Produces narrow-dock-friendly run details when no individual result is focused. */
-export function formatRunSummary(summary: TestSummary): string[] {
+export function formatRunSummary(
+  summary: TestSummary,
+  translate: MessageFormatter = defaultPresentationMessage,
+): string[] {
   const duration =
     summary.durationMs > 0
-      ? ` in ${summary.durationMs < 1000 ? `${Math.round(summary.durationMs)} ms` : `${(summary.durationMs / 1000).toFixed(2)} s`}`
+      ? summary.durationMs < 1000
+        ? `${Math.round(summary.durationMs)} ms`
+        : `${(summary.durationMs / 1000).toFixed(2)} s`
       : "";
+  const totalKey =
+    summary.total === 1
+      ? duration
+        ? "run.one_test_duration"
+        : "run.one_test"
+      : duration
+        ? "run.many_tests_duration"
+        : "run.many_tests";
   return [
-    "Run complete",
-    `${summary.passed} passed, ${summary.failed} failed, ${summary.skipped} skipped`,
-    `${summary.total} ${summary.total === 1 ? "test" : "tests"}${duration}`,
-    ...(summary.unknown > 0 ? [`${summary.unknown} results not reported`] : []),
+    translate("run.complete"),
+    translate("run.counts", {
+      passed: String(summary.passed),
+      failed: String(summary.failed),
+      skipped: String(summary.skipped),
+    }),
+    translate(totalKey, {
+      total: String(summary.total),
+      ...(duration ? { duration } : {}),
+    }),
+    ...(summary.unknown > 0
+      ? [translate("run.unreported", { unknown: String(summary.unknown) })]
+      : []),
   ];
 }
 
@@ -162,28 +186,67 @@ export function summarizeCoverage(files: readonly CoverageFile[]): CoverageSumma
 export function formatCoverageDetails(
   files: readonly CoverageFile[],
   activeFile?: string,
+  translate: MessageFormatter = defaultPresentationMessage,
 ): string[] {
-  if (files.length === 0) return ["No coverage report was produced."];
+  if (files.length === 0) return [translate("coverage.none")];
   const summary = summarizeCoverage(files);
   const active = activeFile
     ? files.find((file) => pathKey(file.path) === pathKey(activeFile))
     : undefined;
   const lines = [
-    `Coverage: ${summary.coveredLines}/${summary.totalLines} lines (${summary.percent}%)`,
-    `${summary.files} source ${summary.files === 1 ? "file" : "files"}`,
+    translate("coverage.summary", {
+      covered: String(summary.coveredLines),
+      total: String(summary.totalLines),
+      percent: String(summary.percent),
+    }),
+    translate(summary.files === 1 ? "coverage.one_file" : "coverage.many_files", {
+      files: String(summary.files),
+    }),
   ];
   if (active) {
     const current = summarizeCoverage([active]);
     lines.push(
-      `Current file: ${current.coveredLines}/${current.totalLines} lines (${current.percent}%)`,
+      translate("coverage.current", {
+        covered: String(current.coveredLines),
+        total: String(current.totalLines),
+        percent: String(current.percent),
+      }),
     );
-    lines.push("Green covered · red uncovered");
+    lines.push(translate("coverage.legend"));
   } else if (activeFile) {
-    lines.push("No data for the current file");
-    lines.push("Open a covered source file");
+    lines.push(translate("coverage.no_current"));
+    lines.push(translate("coverage.open_covered"));
   }
-  lines.push("Explorer shows file percentages");
+  lines.push(translate("coverage.explorer"));
   return lines;
+}
+
+const PRESENTATION_ENGLISH: Readonly<Record<string, string>> = {
+  "run.complete": "Run complete",
+  "run.counts": "%{passed} passed, %{failed} failed, %{skipped} skipped",
+  "run.one_test": "%{total} test",
+  "run.many_tests": "%{total} tests",
+  "run.one_test_duration": "%{total} test in %{duration}",
+  "run.many_tests_duration": "%{total} tests in %{duration}",
+  "run.unreported": "%{unknown} results not reported",
+  "coverage.none": "No coverage report was produced.",
+  "coverage.summary": "Coverage: %{covered}/%{total} lines (%{percent}%)",
+  "coverage.one_file": "%{files} source file",
+  "coverage.many_files": "%{files} source files",
+  "coverage.current": "Current file: %{covered}/%{total} lines (%{percent}%)",
+  "coverage.legend": "Green covered · red uncovered",
+  "coverage.no_current": "No data for the current file",
+  "coverage.open_covered": "Open a covered source file",
+  "coverage.explorer": "Explorer shows file percentages",
+};
+
+function defaultPresentationMessage(
+  key: string,
+  params: Readonly<Record<string, string>> = {},
+): string {
+  return (PRESENTATION_ENGLISH[key] ?? key).replace(/%\{([^}]+)\}/g, (_, name: string) => {
+    return params[name] ?? `%{${name}}`;
+  });
 }
 
 export function mergeDiscoveredTests(

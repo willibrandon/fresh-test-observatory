@@ -138,6 +138,61 @@ test(".NET adapter keeps duplicate method names in distinct classes", async () =
   );
 });
 
+test(".NET adapter drops an ambiguous bare VSTest listing instead of adding a source-less row", async () => {
+  const files = {
+    "/repo/tests/App.Tests.csproj": `<Project Sdk="Microsoft.NET.Sdk"><ItemGroup>
+      <PackageReference Include="MSTest.TestFramework" Version="4.0.0"/>
+      <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.0.0"/>
+    </ItemGroup></Project>`,
+    "/repo/tests/ATests.cs": `namespace Demo; public class ATests { [TestMethod] public void Adds() {} }`,
+    "/repo/tests/BTests.cs": `namespace Demo; public class BTests { [TestMethod] public void Adds() {} }`,
+  };
+  const fake = context(files, () => ({
+    stdout: "The following Tests are available:\n Adds\n",
+    stderr: "",
+    exitCode: 0,
+  }));
+  const adapter = createBuiltInAdapters().find((item) => item.id === "dotnet")!;
+  const discovered = await adapter.discover(fake);
+
+  assert.deepEqual(
+    discovered.tests.map((item) => [item.nativeId, item.source?.path]),
+    [
+      ["Demo.ATests.Adds", "/repo/tests/ATests.cs"],
+      ["Demo.BTests.Adds", "/repo/tests/BTests.cs"],
+    ],
+  );
+  assert.equal(
+    discovered.tests.some((item) => item.nativeId === "Adds"),
+    false,
+  );
+});
+
+test(".NET adapter reconciles CLR nested-type names with their source location", async () => {
+  const files = {
+    "/repo/tests/App.Tests.csproj": `<Project Sdk="Microsoft.NET.Sdk"><ItemGroup>
+      <PackageReference Include="MSTest.TestFramework" Version="4.0.0"/>
+      <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.0.0"/>
+    </ItemGroup></Project>`,
+    "/repo/tests/NestedTests.cs": `namespace Demo;
+public class Outer { public class Inner { [TestMethod] public void Adds() {} } }`,
+  };
+  const fake = context(files, () => ({
+    stdout: "The following Tests are available:\n Demo.Outer+Inner.Adds\n",
+    stderr: "",
+    exitCode: 0,
+  }));
+  const adapter = createBuiltInAdapters().find((item) => item.id === "dotnet")!;
+  const discovered = await adapter.discover(fake);
+
+  assert.equal(discovered.tests.length, 1);
+  assert.equal(discovered.tests[0]!.nativeId, "Demo.Outer+Inner.Adds");
+  assert.deepEqual(discovered.tests[0]!.source, {
+    path: "/repo/tests/NestedTests.cs",
+    line: 2,
+  });
+});
+
 test(".NET adapter aggregates parameterized cases into a failed parent when listing is unavailable", async () => {
   const reportPath = "/repo/.fresh-test-observatory/dotnet/App.Tests/App.Tests.trx";
   const files = {

@@ -642,7 +642,7 @@ function mergeWithSourceLocations(
     );
   }
   const consumedSources = new Set<string>();
-  const enriched = listedTests.map((listed) => {
+  const enriched = listedTests.flatMap((listed) => {
     const listedBase = dotnetBaseName(listed.nativeId);
     const exact = relevantSources.filter((candidate) => candidate.nativeId === listedBase);
     const suffix =
@@ -660,7 +660,9 @@ function mergeWithSourceLocations(
         : relevantSources.filter((candidate) => candidate.nativeId.split(".").at(-1) === method);
     const candidates = exact.length > 0 ? exact : suffix.length > 0 ? suffix : methodMatches;
     const source = candidates.length === 1 ? candidates[0] : undefined;
-    if (!source) return listed;
+    // VSTest can emit only a method display name. When more than one source
+    // method has that name, retaining the bare row creates a third fake test.
+    if (!source) return candidates.length > 1 && !listedBase.includes(".") ? [] : [listed];
     const parameters = listed.nativeId.slice(listedBase.length);
     const listedIsQualified = listedBase.includes(".");
     const nativeId = listedIsQualified ? listed.nativeId : `${source.nativeId}${parameters}`;
@@ -675,7 +677,7 @@ function mergeWithSourceLocations(
     if (source.status === "skipped") result.status = "skipped";
     if (source.source) result.source = source.source;
     if (!listed.suite && source.suite) result.suite = source.suite;
-    return result;
+    return [result];
   });
   const untouched = sourceTests.filter(
     (source) => (project && source.project !== project) || !consumedSources.has(source.id),

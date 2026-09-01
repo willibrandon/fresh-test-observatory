@@ -28,6 +28,7 @@ export interface ObservatoryPort {
   progress(message: string): void;
   changed(): void;
   cancelActiveProcess(): Promise<boolean>;
+  translate?(key: string, params?: Readonly<Record<string, string>>): string;
 }
 
 export interface ObservatoryOutput {
@@ -157,7 +158,7 @@ export class TestObservatoryController {
 
   async refresh(): Promise<number> {
     if (this.busy) return this.tests.length;
-    this.beginOperation("Discovering tests");
+    this.beginOperation(this.text("controller.discovering"));
     try {
       const context = this.port.createContext();
       const root = context.cwd;
@@ -168,22 +169,39 @@ export class TestObservatoryController {
         const adapter = enabled[index]!;
         if (this.cancelRequested) break;
         try {
-          this.setProgress(`Detecting ${adapter.label} (${index + 1}/${enabled.length})`);
+          this.setProgress(
+            this.text("controller.detecting_adapter", {
+              adapter: adapter.label,
+              current: String(index + 1),
+              total: String(enabled.length),
+            }),
+          );
           if (!(await adapter.detect(context))) continue;
           detected.add(adapter.id);
-          this.setProgress(`Discovering ${adapter.label} tests (${index + 1}/${enabled.length})`);
+          this.setProgress(
+            this.text("controller.discovering_adapter", {
+              adapter: adapter.label,
+              current: String(index + 1),
+              total: String(enabled.length),
+            }),
+          );
           const result = await adapter.discover(context);
           discovered.push(...result.tests);
           if (result.diagnostics) this.diagnostics.push(...result.diagnostics);
         } catch (error) {
-          this.diagnostics.push(`${adapter.label}: ${errorMessage(error)}`);
+          this.diagnostics.push(
+            this.text("controller.adapter_error", {
+              adapter: adapter.label,
+              error: errorMessage(error),
+            }),
+          );
         }
       }
       if (pathKey(root) !== pathKey(this.port.workspaceRoot())) {
         this.discoveryRoot = undefined;
         this.activeAdapterIds.clear();
         this.tests = [];
-        this.diagnostics = ["Workspace changed during test discovery; refresh again"];
+        this.diagnostics = [this.text("controller.workspace_changed")];
         return 0;
       }
       const previous = workspaceDiscoveryIsCurrent(this.discoveryRoot, root) ? this.tests : [];
@@ -209,20 +227,24 @@ export class TestObservatoryController {
       await this.refresh();
     }
     if (!isTrustedWorkspace(this.port.trustLevel())) {
-      this.diagnostics = ["Trust this workspace to run tests"];
+      this.diagnostics = [this.text("controller.trust_run")];
       this.notify();
       return this.currentSummary();
     }
     const selection = selectTestsForScope(this.tests, scope, selectionContext);
     if (scope !== "workspace" && selection.length === 0) {
-      this.diagnostics = [emptySelectionMessage(scope)];
+      this.diagnostics = [this.text(emptySelectionKey(scope))];
       this.notify();
       return this.currentSummary();
     }
     const presentation = runPresentation(scope, selection);
     this.summaryTestIds = presentation.summaryTestIds;
     this.focusedTestId = presentation.selectedTestId;
-    this.beginOperation(`Running ${selection.length} ${selection.length === 1 ? "test" : "tests"}`);
+    this.beginOperation(
+      this.text(selection.length === 1 ? "controller.running_one" : "controller.running_many", {
+        count: String(selection.length),
+      }),
+    );
     const runningIds = new Set(
       selection
         .filter(
@@ -240,7 +262,7 @@ export class TestObservatoryController {
       for (const adapterId of runnableAdapterIds) {
         if (this.reportOnlyAdapterIds.has(adapterId) || !this.activeAdapterIds.has(adapterId)) {
           this.diagnostics.push(
-            `Tests from the imported report '${adapterId}' cannot be rerun without a registered active adapter`,
+            this.text("controller.imported_not_runnable", { adapter: adapterId }),
           );
         }
       }
@@ -252,13 +274,22 @@ export class TestObservatoryController {
         if (this.cancelRequested) break;
         const adapterTests = selection.filter((test) => test.adapterId === adapter.id);
         if (adapterTests.length === 0) continue;
-        this.setProgress(`Running ${adapter.label} (${index + 1}/${runnable.length})`);
+        this.setProgress(
+          this.text("controller.running_adapter", {
+            adapter: adapter.label,
+            current: String(index + 1),
+            total: String(runnable.length),
+          }),
+        );
         const request = createRunRequest(scope, adapterTests, selectionContext);
         try {
           const result = await adapter.run(context, request);
           this.applyAdapterResult(adapter, adapterTests, result);
         } catch (error) {
-          const message = `${adapter.label}: ${errorMessage(error)}`;
+          const message = this.text("controller.adapter_error", {
+            adapter: adapter.label,
+            error: errorMessage(error),
+          });
           this.diagnostics.push(message);
           this.failTests(adapterTests, message);
         }
@@ -282,12 +313,12 @@ export class TestObservatoryController {
   ): Promise<readonly CoverageFile[]> {
     if (this.busy) return this.coverage;
     if (!isTrustedWorkspace(this.port.trustLevel())) {
-      this.diagnostics = ["Trust this workspace to collect coverage"];
+      this.diagnostics = [this.text("controller.trust_coverage")];
       this.notify();
       return this.coverage;
     }
     const selection = selectTestsForScope(this.tests, "workspace", selectionContext);
-    this.beginOperation("Collecting coverage");
+    this.beginOperation(this.text("controller.collecting_coverage"));
     const files: CoverageFile[] = [];
     try {
       const context = this.port.createContext();
@@ -304,7 +335,11 @@ export class TestObservatoryController {
         const adapterTests = selection.filter((test) => test.adapterId === adapter.id);
         if (adapterTests.length === 0) continue;
         this.setProgress(
-          `Collecting ${adapter.label} coverage (${index + 1}/${coverageAdapters.length})`,
+          this.text("controller.collecting_adapter", {
+            adapter: adapter.label,
+            current: String(index + 1),
+            total: String(coverageAdapters.length),
+          }),
         );
         try {
           const result = await adapter.collectCoverage(
@@ -315,7 +350,12 @@ export class TestObservatoryController {
           if (result.output) this.outputs.push({ adapterId: adapter.id, text: result.output });
           if (result.diagnostics) this.diagnostics.push(...result.diagnostics);
         } catch (error) {
-          this.diagnostics.push(`${adapter.label}: ${errorMessage(error)}`);
+          this.diagnostics.push(
+            this.text("controller.adapter_error", {
+              adapter: adapter.label,
+              error: errorMessage(error),
+            }),
+          );
         }
       }
       this.coverage = mergeCoverage(files);
@@ -329,7 +369,7 @@ export class TestObservatoryController {
   async stop(): Promise<boolean> {
     if (!this.busy) return false;
     this.cancelRequested = true;
-    this.setProgress("Stopping test run");
+    this.setProgress(this.text("controller.stopping"));
     return this.port.cancelActiveProcess();
   }
 
@@ -342,7 +382,11 @@ export class TestObservatoryController {
     if (result.output) this.outputs.push({ adapterId: adapter.id, text: result.output });
     if (result.diagnostics) this.diagnostics.push(...result.diagnostics);
     if (result.exitCode !== 0 && result.tests.every((test) => test.status !== "failed")) {
-      const message = `${adapter.label} exited ${result.exitCode}: ${firstUsefulLine(result.output)}`;
+      const message = this.text("controller.adapter_exit", {
+        adapter: adapter.label,
+        code: String(result.exitCode),
+        detail: firstUsefulLine(result.output, this.text("controller.no_diagnostic_output")),
+      });
       this.diagnostics.push(message);
       this.failTests(selection, message);
     }
@@ -378,6 +422,10 @@ export class TestObservatoryController {
 
   private notify(): void {
     this.port.changed();
+  }
+
+  private text(key: string, params: Readonly<Record<string, string>> = {}): string {
+    return this.port.translate?.(key, params) ?? defaultControllerMessage(key, params);
   }
 
   private removeAdapterState(id: string): void {
@@ -426,23 +474,52 @@ function createRunRequest(
   };
 }
 
-function emptySelectionMessage(scope: TestScope): string {
+function emptySelectionKey(scope: TestScope): string {
   return scope === "failed"
-    ? "There are no failed tests to rerun"
+    ? "controller.no_failed"
     : scope === "selected"
-      ? "No test is selected"
-      : "No test was found for the current location";
+      ? "controller.no_selected"
+      : "controller.no_location";
 }
 
-function firstUsefulLine(output: string): string {
+function firstUsefulLine(output: string, fallback: string): string {
   return (
     output
       .split(/\r?\n/)
       .map((line) => line.trim())
-      .find(Boolean) ?? "no diagnostic output"
+      .find(Boolean) ?? fallback
   );
 }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+const CONTROLLER_ENGLISH: Readonly<Record<string, string>> = {
+  "controller.discovering": "Discovering tests",
+  "controller.detecting_adapter": "Detecting %{adapter} (%{current}/%{total})",
+  "controller.discovering_adapter": "Discovering %{adapter} tests (%{current}/%{total})",
+  "controller.adapter_error": "%{adapter}: %{error}",
+  "controller.workspace_changed": "Workspace changed during test discovery; refresh again",
+  "controller.trust_run": "Trust this workspace to run tests",
+  "controller.running_one": "Running %{count} test",
+  "controller.running_many": "Running %{count} tests",
+  "controller.imported_not_runnable":
+    "Tests from the imported report '%{adapter}' cannot be rerun without a registered active adapter",
+  "controller.running_adapter": "Running %{adapter} (%{current}/%{total})",
+  "controller.trust_coverage": "Trust this workspace to collect coverage",
+  "controller.collecting_coverage": "Collecting coverage",
+  "controller.collecting_adapter": "Collecting %{adapter} coverage (%{current}/%{total})",
+  "controller.stopping": "Stopping test run",
+  "controller.adapter_exit": "%{adapter} exited %{code}: %{detail}",
+  "controller.no_diagnostic_output": "no diagnostic output",
+  "controller.no_failed": "There are no failed tests to rerun",
+  "controller.no_selected": "No test is selected",
+  "controller.no_location": "No test was found for the current location",
+};
+
+function defaultControllerMessage(key: string, params: Readonly<Record<string, string>>): string {
+  return (CONTROLLER_ENGLISH[key] ?? key).replace(/%\{([^}]+)\}/g, (_, name: string) => {
+    return params[name] ?? `%{${name}}`;
+  });
 }

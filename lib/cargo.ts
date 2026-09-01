@@ -430,15 +430,16 @@ function rustModulePath(path: string, root: string, before: string): string[] {
   const file = parts.pop() ?? "";
   const sourceIndex = parts.indexOf("src");
   const testsIndex = parts.indexOf("tests");
+  const directoryIntegrationTarget = testsIndex >= 0 && parts.length > testsIndex + 1;
   const modules =
     sourceIndex >= 0
       ? parts.slice(sourceIndex + 1)
       : testsIndex >= 0
-        ? parts.slice(testsIndex + 1)
+        ? parts.slice(testsIndex + 2)
         : parts;
-  if (!/^(?:lib|main|mod)\.rs$/.test(file) && !(testsIndex >= 0 && modules.length === 0)) {
+  if (!/^(?:lib|main|mod)\.rs$/.test(file) && !(testsIndex >= 0 && !directoryIntegrationTarget)) {
     modules.push(stem(file));
-  } else if (testsIndex >= 0 && /^(?:lib|main)\.rs$/.test(file)) modules.push(stem(file));
+  }
   modules.push(...activeInlineRustModules(before));
   return modules.filter(Boolean);
 }

@@ -184,7 +184,8 @@ export function discoverDotnetSourceTests(
     const namespace = lastCapture(before, /\bnamespace\s+([\w.]+)/g) ?? "";
     const typePath = activeCsharpTypes(before);
     if (typePath.length === 0) continue;
-    const nativeId = [namespace, ...typePath, method].filter(Boolean).join(".");
+    // CLR test identities use '+' between nested types and '.' before the method.
+    const nativeId = [namespace, typePath.join("+"), method].filter(Boolean).join(".");
     tests.push({
       id: `dotnet:${project.path}:${nativeId}`,
       nativeId,

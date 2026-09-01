@@ -271,6 +271,25 @@ test("discoverRustSourceTests follows nested files, mod roots, and active inline
     integration.map((item) => [item.nativeId, item.framework, item.suite]),
     [["creates_resource", "rust-integration", ["integration:api"]]],
   );
+  const directoryIntegration = [
+    ...discoverRustSourceTests(
+      "/repo/tests/integration/main.rs",
+      "#[test]\nfn root_case() {}",
+      "/repo",
+    ),
+    ...discoverRustSourceTests(
+      "/repo/tests/integration/helpers.rs",
+      "#[test]\nfn helper_case() {}",
+      "/repo",
+    ),
+  ];
+  assert.deepEqual(
+    directoryIntegration.map((item) => [item.nativeId, item.target]),
+    [
+      ["root_case", "integration:integration"],
+      ["helpers::helper_case", "integration:integration"],
+    ],
+  );
   const source = `mod closed { #[test] fn first() {} }
 mod active {
   mod nested { #[test] fn second() {} }
