@@ -20,14 +20,26 @@ export function discoverRustSourceTests(
   workspaceRoot: string,
 ): TestCase[] {
   const tests: TestCase[] = [];
-  const expression =
-    /((?:\s*#\s*\[[^\]]+\]\s*)+)\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)\s*[<(]/g;
-  for (const match of source.matchAll(expression)) {
-    const attrs = match[1] ?? "";
+  const starts = lineStarts(source);
+  const declaration =
+    /(?:pub(?:\([^()\r\n]{0,128}\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*[<(]/y;
+  let searchFrom = 0;
+  for (;;) {
+    const attributeStart = source.indexOf("#", searchFrom);
+    if (attributeStart < 0) break;
+    const block = rustAttributeBlock(source, attributeStart);
+    if (!block) {
+      searchFrom = attributeStart + 1;
+      continue;
+    }
+    searchFrom = block.end;
+    const attrs = block.attributes;
     if (!/#\s*\[\s*(?:(?:tokio|async_std)::)?test\b|#\s*\[\s*rstest\b/.test(attrs)) continue;
-    const name = match[2]!;
-    const before = source.slice(0, match.index);
-    const functionOffset = match.index + match[0].lastIndexOf(name);
+    declaration.lastIndex = block.end;
+    const match = declaration.exec(source);
+    if (!match) continue;
+    const name = match[1]!;
+    const before = source.slice(0, attributeStart);
     const modulePath = rustModulePath(path, workspaceRoot, before);
     const nativeId = [...modulePath, name].join("::");
     const integrationTarget = rustIntegrationTarget(path, workspaceRoot);
@@ -43,11 +55,73 @@ export function discoverRustSourceTests(
           : "libtest",
       ...(integrationTarget ? { target: integrationTarget } : {}),
       suite: [...(integrationTarget ? [integrationTarget] : []), ...modulePath],
-      source: { path, line: source.slice(0, functionOffset).split("\n").length },
+      source: { path, line: lineNumberAt(starts, match.index) },
       status: /#\s*\[\s*ignore\b/.test(attrs) ? "skipped" : "unknown",
     });
+    searchFrom = declaration.lastIndex;
   }
   return tests;
+}
+
+function rustAttributeBlock(
+  source: string,
+  start: number,
+): { attributes: string; end: number } | undefined {
+  let cursor = start;
+  let attributes = "";
+  while (cursor < source.length && source[cursor] === "#") {
+    const attributeStart = cursor;
+    cursor += 1;
+    while (/\s/.test(source[cursor] ?? "")) cursor += 1;
+    if (source[cursor] !== "[") return undefined;
+    const end = matchingSquareBracket(source, cursor);
+    if (end < 0) return undefined;
+    attributes += source.slice(attributeStart, end + 1);
+    cursor = end + 1;
+    while (/\s/.test(source[cursor] ?? "")) cursor += 1;
+  }
+  return attributes ? { attributes, end: cursor } : undefined;
+}
+
+function matchingSquareBracket(source: string, start: number): number {
+  let depth = 1;
+  let quote: '"' | "'" | undefined;
+  for (let cursor = start + 1; cursor < source.length; cursor += 1) {
+    const character = source[cursor]!;
+    if (quote) {
+      if (character === "\\") cursor += 1;
+      else if (character === quote) quote = undefined;
+    } else if (character === '"' || character === "'") {
+      quote = character;
+    } else if (character === "[") {
+      depth += 1;
+    } else if (character === "]") {
+      depth -= 1;
+      if (depth === 0) return cursor;
+    }
+  }
+  return -1;
+}
+
+function lineStarts(source: string): number[] {
+  const starts = [0];
+  let cursor = 0;
+  while ((cursor = source.indexOf("\n", cursor)) >= 0) {
+    cursor += 1;
+    starts.push(cursor);
+  }
+  return starts;
+}
+
+function lineNumberAt(starts: readonly number[], offset: number): number {
+  let low = 0;
+  let high = starts.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (starts[middle]! <= offset) low = middle + 1;
+    else high = middle;
+  }
+  return low;
 }
 
 /** Parses `cargo nextest list --message-format json`. */

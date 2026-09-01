@@ -23,7 +23,21 @@ export function stripCdata(value: string): string {
 
 export function textContent(value: string | undefined): string {
   if (!value) return "";
-  return decodeXml(stripCdata(value).replace(/<[^>]+>/g, "")).trim();
+  return decodeXml(stripMarkup(stripCdata(value))).trim();
+}
+
+function stripMarkup(value: string): string {
+  let text = "";
+  let cursor = 0;
+  while (cursor < value.length) {
+    const open = value.indexOf("<", cursor);
+    if (open < 0) return text + value.slice(cursor);
+    text += value.slice(cursor, open);
+    const close = value.indexOf(">", open + 1);
+    if (close < 0) return text + value.slice(open);
+    cursor = close + 1;
+  }
+  return text;
 }
 
 export function attributes(tag: string): Record<string, string> {

@@ -164,20 +164,27 @@ export function discoverDotnetSourceTests(
   if (/\.fs$/i.test(path)) return discoverFsharpSourceTests(path, source, project);
   if (/\.vb$/i.test(path)) return discoverVisualBasicSourceTests(path, source, project);
   const tests: TestCase[] = [];
-  const declaration =
-    /((?:\s*\[[^\]]+\]\s*)+)(?:(?:public|private|protected|internal|static|virtual|sealed|override|new|async|partial)\s+)*(?:[\w<>,.?\[\]]+\s+)+(?<method>@?[A-Za-z_]\w*)\s*\(/g;
-  for (const match of source.matchAll(declaration)) {
-    const attrs = match[1] ?? "";
+  const starts = lineStarts(source);
+  let searchFrom = 0;
+  for (;;) {
+    const attributeStart = source.indexOf("[", searchFrom);
+    if (attributeStart < 0) break;
+    const block = squareAttributeBlock(source, attributeStart);
+    if (!block) {
+      searchFrom = attributeStart + 1;
+      continue;
+    }
+    searchFrom = block.end;
+    const attrs = block.attributes;
     if (!isTestAttribute(attrs)) continue;
-    const method = match.groups?.method?.replace(/^@/, "");
-    if (!method) continue;
-    const before = source.slice(0, match.index);
+    const declaration = csharpMethodAt(source, block.end);
+    if (!declaration) continue;
+    const method = declaration.method.replace(/^@/, "");
+    const before = source.slice(0, attributeStart);
     const namespace = lastCapture(before, /\bnamespace\s+([\w.]+)/g) ?? "";
     const typePath = activeCsharpTypes(before);
     if (typePath.length === 0) continue;
     const nativeId = [namespace, ...typePath, method].filter(Boolean).join(".");
-    const methodOffset = match.index + match[0].lastIndexOf(match.groups!.method!);
-    const line = source.slice(0, methodOffset).split("\n").length;
     tests.push({
       id: `dotnet:${project.path}:${nativeId}`,
       nativeId,
@@ -186,9 +193,10 @@ export function discoverDotnetSourceTests(
       framework: project.flavor,
       project: project.path,
       suite: [project.name, namespace, ...typePath].filter(Boolean),
-      source: { path, line },
+      source: { path, line: lineNumberAt(starts, declaration.offset) },
       status: ignoredAttribute(attrs) ? "skipped" : "unknown",
     });
+    searchFrom = declaration.offset + declaration.method.length;
   }
   return tests;
 }
@@ -199,14 +207,21 @@ function discoverFsharpSourceTests(
   project: DotnetProject,
 ): TestCase[] {
   const tests: TestCase[] = [];
-  const expression =
-    /((?:\s*\[<[^>]+>\]\s*)+)\s*(?:member\s+(?:[^.\s]+\.)?|let\s+(?:rec\s+)?)(?<method>``[^`]+``|[A-Za-z_]\w*)\s*(?:[=(])/g;
-  for (const match of source.matchAll(expression)) {
-    const attrs = match[1] ?? "";
+  let attributesText = "";
+  for (const line of sourceLines(source)) {
+    const parsed = leadingAttributes(line.text, "[<", ">]");
+    if (parsed.attributes) attributesText += parsed.attributes;
+    const code = parsed.remainder.trim();
+    if (!code) continue;
+    const attrs = attributesText;
+    attributesText = "";
     if (!isTestAttribute(attrs.replace(/\[</g, "[").replace(/>\]/g, "]"))) continue;
-    const method = match.groups?.method?.replace(/^``|``$/g, "");
+    const declaration = code.match(
+      /^(?:member\s+(?:[^.\s]+\.)?|let\s+(?:rec\s+)?)(``[^`\r\n]+``|[A-Za-z_][A-Za-z0-9_]*)/,
+    );
+    const method = declaration?.[1]?.replace(/^``|``$/g, "");
     if (!method) continue;
-    const before = source.slice(0, match.index);
+    const before = source.slice(0, line.offset);
     const namespace = lastCapture(before, /^\s*namespace\s+([\w.]+)/gm) ?? "";
     const typeName = lastAlternativeCapture(before, /^\s*type\s+(?:``([^`]+)``|([A-Za-z_]\w*))/gm);
     const resolvedType =
@@ -214,18 +229,8 @@ function discoverFsharpSourceTests(
       lastAlternativeCapture(before, /^\s*module\s+(?:``([^`]+)``|([A-Za-z_]\w*))/gm) ??
       "";
     const nativeId = [namespace, resolvedType, method].filter(Boolean).join(".");
-    const methodOffset = match.index + match[0].lastIndexOf(match.groups!.method!);
     tests.push(
-      sourceTest(
-        project,
-        path,
-        nativeId,
-        method,
-        [namespace, resolvedType],
-        source,
-        methodOffset,
-        attrs,
-      ),
+      sourceTest(project, path, nativeId, method, [namespace, resolvedType], line.number, attrs),
     );
   }
   return tests;
@@ -237,17 +242,20 @@ function discoverVisualBasicSourceTests(
   project: DotnetProject,
 ): TestCase[] {
   const tests: TestCase[] = [];
-  const expression =
-    /((?:\s*<[^>]+>\s*)+)(?:(?:Public|Private|Protected|Friend|Shared|Async|Overrides|Overridable)\s+)*(?:Sub|Function)\s+(?<method>[A-Za-z_]\w*)\s*\(/gi;
-  for (const match of source.matchAll(expression)) {
-    const attrs = match[1] ?? "";
+  let attributesText = "";
+  for (const line of sourceLines(source)) {
+    const parsed = leadingAttributes(line.text, "<", ">");
+    if (parsed.attributes) attributesText += parsed.attributes;
+    const code = parsed.remainder.trim();
+    if (!code) continue;
+    const attrs = attributesText;
+    attributesText = "";
     if (!isTestAttribute(attrs.replace(/</g, "[").replace(/>/g, "]"))) continue;
-    const method = match.groups?.method;
+    const method = code.match(/\b(?:Sub|Function)\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/i)?.[1];
     if (!method) continue;
-    const before = source.slice(0, match.index);
+    const before = source.slice(0, line.offset);
     const scopes = activeVisualBasicScopes(before);
     const nativeId = [...scopes.namespaces, ...scopes.types, method].join(".");
-    const methodOffset = match.index + match[0].toLowerCase().lastIndexOf(method.toLowerCase());
     tests.push(
       sourceTest(
         project,
@@ -255,8 +263,7 @@ function discoverVisualBasicSourceTests(
         nativeId,
         method,
         [...scopes.namespaces, ...scopes.types],
-        source,
-        methodOffset,
+        line.number,
         attrs,
       ),
     );
@@ -270,8 +277,7 @@ function sourceTest(
   nativeId: string,
   label: string,
   suite: string[],
-  source: string,
-  offset: number,
+  line: number,
   attributesText: string,
 ): TestCase {
   return {
@@ -282,9 +288,141 @@ function sourceTest(
     framework: project.flavor,
     project: project.path,
     suite: [project.name, ...suite].filter(Boolean),
-    source: { path, line: source.slice(0, offset).split("\n").length },
+    source: { path, line },
     status: ignoredAttribute(attributesText) ? "skipped" : "unknown",
   };
+}
+
+function leadingAttributes(
+  line: string,
+  open: string,
+  close: string,
+): { attributes: string; remainder: string } {
+  let cursor = 0;
+  let attributes = "";
+  while (cursor < line.length) {
+    while (/\s/.test(line[cursor] ?? "")) cursor += 1;
+    const start = cursor;
+    if (!line.startsWith(open, cursor)) break;
+    const end =
+      open === "[" && close === "]"
+        ? matchingSquareBracket(line, cursor)
+        : line.indexOf(close, cursor + open.length);
+    if (end < 0) {
+      cursor = start;
+      break;
+    }
+    cursor = end + close.length;
+    attributes += line.slice(start, cursor);
+  }
+  return { attributes, remainder: line.slice(cursor) };
+}
+
+function matchingSquareBracket(line: string, start: number): number {
+  let depth = 1;
+  let quote: '"' | "'" | undefined;
+  for (let cursor = start + 1; cursor < line.length; cursor += 1) {
+    const character = line[cursor]!;
+    if (quote) {
+      if (character === "\\") cursor += 1;
+      else if (character === quote) quote = undefined;
+    } else if (character === '"' || character === "'") {
+      quote = character;
+    } else if (character === "[") {
+      depth += 1;
+    } else if (character === "]") {
+      depth -= 1;
+      if (depth === 0) return cursor;
+    }
+  }
+  return -1;
+}
+
+function squareAttributeBlock(
+  source: string,
+  start: number,
+): { attributes: string; end: number } | undefined {
+  let cursor = start;
+  let attributes = "";
+  while (cursor < source.length && source[cursor] === "[") {
+    const end = matchingSquareBracket(source, cursor);
+    if (end < 0) return undefined;
+    attributes += source.slice(cursor, end + 1);
+    cursor = end + 1;
+    while (/\s/.test(source[cursor] ?? "")) cursor += 1;
+  }
+  return attributes ? { attributes, end: cursor } : undefined;
+}
+
+function csharpMethodAt(
+  source: string,
+  start: number,
+): { method: string; offset: number } | undefined {
+  const parenthesis = source.indexOf("(", start);
+  if (parenthesis < 0 || parenthesis - start > 4_096) return undefined;
+  const head = source.slice(start, parenthesis);
+  if (/[{};]/.test(head)) return undefined;
+  const method = identifierBeforeParenthesis(`${head}(`);
+  if (!method) return undefined;
+  const relativeOffset = head.lastIndexOf(method);
+  return relativeOffset < 0 ? undefined : { method, offset: start + relativeOffset };
+}
+
+function identifierBeforeParenthesis(code: string): string | undefined {
+  const parenthesis = code.indexOf("(");
+  if (parenthesis < 0) return undefined;
+  let end = parenthesis;
+  while (/\s/.test(code[end - 1] ?? "")) end -= 1;
+  if (code[end - 1] === ">") {
+    let depth = 1;
+    end -= 1;
+    while (end > 0 && depth > 0) {
+      end -= 1;
+      if (code[end] === ">") depth += 1;
+      else if (code[end] === "<") depth -= 1;
+    }
+  }
+  while (/\s/.test(code[end - 1] ?? "")) end -= 1;
+  let start = end;
+  while (/[A-Za-z0-9_@]/.test(code[start - 1] ?? "")) start -= 1;
+  const identifier = code.slice(start, end);
+  return /^@?[A-Za-z_][A-Za-z0-9_]*$/.test(identifier) ? identifier : undefined;
+}
+
+function sourceLines(source: string): Array<{ text: string; offset: number; number: number }> {
+  const lines = [];
+  let offset = 0;
+  let number = 1;
+  for (;;) {
+    const newline = source.indexOf("\n", offset);
+    const end = newline < 0 ? source.length : newline;
+    const raw = source.slice(offset, end);
+    lines.push({ text: raw.endsWith("\r") ? raw.slice(0, -1) : raw, offset, number });
+    if (newline < 0) return lines;
+    offset = newline + 1;
+    number += 1;
+  }
+}
+
+function lineStarts(source: string): number[] {
+  const starts = [0];
+  let cursor = 0;
+  while ((cursor = source.indexOf("\n", cursor)) >= 0) {
+    cursor += 1;
+    starts.push(cursor);
+  }
+  return starts;
+}
+
+function lineNumberAt(starts: readonly number[], offset: number): number {
+  let low = 0;
+  let high = starts.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (starts[middle]! <= offset) low = middle + 1;
+    else high = middle;
+  }
+  return low;
 }
 
 /** Tracks the enclosing C# type declarations instead of using the last name. */

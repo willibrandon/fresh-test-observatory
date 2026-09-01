@@ -63,6 +63,19 @@ test("discoverRustSourceTests recognizes libtest, async tests, rstest, ignore st
   );
 });
 
+test("discoverRustSourceTests scans long attribute sequences without backtracking", () => {
+  const harmless = "#[cfg(test)] ".repeat(4_000) + "const VALUE: usize = 1;";
+  assert.deepEqual(discoverRustSourceTests("/repo/src/lib.rs", harmless, "/repo"), []);
+
+  const [discovered] = discoverRustSourceTests(
+    "/repo/src/lib.rs",
+    "#[cfg(test)] #[test] pub fn visible() {}",
+    "/repo",
+  );
+  assert.equal(discovered?.nativeId, "visible");
+  assert.equal(discovered?.source?.line, 1);
+});
+
 test("parseNextestList consumes the rust-suites JSON contract", () => {
   const input = JSON.stringify({
     "rust-suites": {

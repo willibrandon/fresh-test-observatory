@@ -133,6 +133,21 @@ public class Outer
   assert.deepEqual(result?.suite, ["App.Tests", "Demo.Tests", "Outer", "Inner"]);
 });
 
+test("discoverDotnetSourceTests scans long and nested attribute syntax without backtracking", () => {
+  const detected = project(`<Project Sdk="MSTest.Sdk/4.0.0" />`);
+  const harmless = "[Obsolete] ".repeat(4_000) + "public class Metadata {}";
+  assert.deepEqual(discoverDotnetSourceTests("/repo/tests/Metadata.cs", harmless, detected), []);
+
+  const source = `namespace Demo;
+public class Cases
+{
+  [TestCase(new[] { 1, 2 })] public void Accepts<T>() { }
+}`;
+  const [discovered] = discoverDotnetSourceTests("/repo/tests/Cases.cs", source, detected);
+  assert.equal(discovered?.nativeId, "Demo.Cases.Accepts");
+  assert.equal(discovered?.source?.line, 4);
+});
+
 test("discoverDotnetSourceTests recognizes F# and Visual Basic tests", () => {
   const detected = project(`<Project Sdk="MSTest.Sdk/4.0.0" />`);
   const fsharp = `[<TestClass>]

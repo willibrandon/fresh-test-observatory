@@ -9,6 +9,7 @@ test("XML helpers decode named and numeric entities without damaging unknown ent
   assert.equal(escapeXml("<&\"'>"), "&lt;&amp;&quot;&apos;&gt;");
   assert.deepEqual(attributes("name=\"A &amp; B\" count='2'"), { name: "A & B", count: "2" });
   assert.equal(textContent("<![CDATA[one < two]]>"), "one < two");
+  assert.equal(textContent("safe <<script>alert</script> tail"), "safe alert tail");
 });
 
 test("parseJunit ingests pass, skip, error, duration, entities, and source location", () => {
