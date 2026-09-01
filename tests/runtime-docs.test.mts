@@ -268,7 +268,7 @@ test("README names every public command, dock key, setting, and status token", (
   for (const setting of settings) assert.ok(readme.includes(`\`${setting}\``), setting);
   assert.match(readme, /fresh-test-observatory:test-summary/);
   assert.match(readme, /Settings, Status Bar/);
-  assert.match(readme, /name are intentionally the same/);
+  assert.ok(readme.includes("[Fresh](https://github.com/sinelaw/fresh)"));
 });
 
 test("package metadata uses live canonical URLs", () => {
