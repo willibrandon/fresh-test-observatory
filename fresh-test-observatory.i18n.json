@@ -54,7 +54,7 @@
     "setting.no_build": "Pass --no-build to .NET discovery and runs",
     "setting.no_restore": "Pass --no-restore to .NET discovery and runs",
     "setting.report_dir": "Report directory; relative values live below the authority temp directory",
-    "setting.dock_width": "Utility dock width as a percentage of the editor",
+    "setting.dock_width": "Height of the dock as a percentage of the window, applied each time it opens. Drag the separator above the dock to change it for the session.",
     "setting.auto_open_failure": "Open Test Observatory when a run fails",
     "setting.terminal_runs": "Run test commands in visible terminals by default",
     "setting.enabled_adapters": "Adapter ids to enable; an empty list enables all adapters",
@@ -110,7 +110,7 @@
     "hint.back": "back",
     "prompt.filter": "Filter tests:",
     "prompt.report": "Choose a JUnit or Cobertura report",
-    "status.discovered": "Test Observatory discovered %{count} tests",
+    "status.discovered": "Test Observatory discovered %{count} tests in %{elapsed}",
     "status.coverage_hidden": "Test coverage hidden",
     "status.coverage": "Coverage: %{covered}/%{total} lines (%{percent}%)",
     "status.no_coverage": "No coverage report was produced",
@@ -166,9 +166,15 @@
     "coverage.open_covered": "Open a covered source file",
     "coverage.explorer": "Explorer shows file percentages",
     "error.untrusted": "Workspace is not trusted",
-    "error.discovery_truncated": "Test discovery exceeded 100000 matches for %{glob}",
     "error.file_walk_limit": "File discovery exceeded 100000 files for %{glob}",
     "error.read_report": "Could not read report %{path}",
-    "error.unhandled": "Test Observatory: %{error}"
+    "error.unhandled": "Test Observatory: %{error}",
+    "panel.progress_counts": "%{completed}/%{total} finished · %{elapsed}",
+    "panel.progress_elapsed": "%{elapsed} elapsed",
+    "status.running_prefix": "Tests running",
+    "panel.more_in_output": "%{count} more lines in Output (o)",
+    "panel.loaded": "%{count} tests loaded in %{elapsed}",
+    "run.complete_elapsed": "Run complete in %{elapsed}",
+    "status.summary_elapsed": "Tests: %{passed} passed, %{failed} failed, %{skipped} skipped in %{elapsed}"
   }
 }

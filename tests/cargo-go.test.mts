@@ -4,11 +4,14 @@ import {
   buildCargoCommand,
   buildCargoDocListCommand,
   buildCargoListCommand,
+  buildCargoLocateWorkspaceCommand,
   discoverRustSourceTests,
   parseCargoList,
   parseCargoRun,
+  parseCargoStatusLine,
   parseNextestList,
   parseNextestRun,
+  parseNextestStatusLine,
 } from "../lib/cargo.ts";
 import type { TestCase } from "../lib/contracts.ts";
 import {
@@ -16,6 +19,7 @@ import {
   discoverGoSourceTests,
   modulePathFromGoMod,
   parseGoCoverProfile,
+  parseGoStatusLine,
   parseGoTestJson,
 } from "../lib/go.ts";
 
@@ -193,7 +197,7 @@ test("Cargo commands prefer nextest final-status output and retain plain Cargo f
       "--workspace",
       "--all-targets",
       "--status-level",
-      "none",
+      "all",
       "--final-status-level",
       "all",
       "-E",
@@ -418,4 +422,48 @@ example.com/demo/calc/add.go:4.2,5.3 1 3`;
     },
   ]);
   assert.equal(modulePathFromGoMod("module example.com/demo\n\ngo 1.24\n"), "example.com/demo");
+});
+
+test("live status parsers recognise finished tests on nextest, libtest, and go test streams", () => {
+  assert.deepEqual(parseNextestStatusLine("        PASS [   0.003s] demo tests::adds"), {
+    status: "passed",
+    nativeId: "tests::adds",
+    durationMs: 3,
+  });
+  assert.deepEqual(parseNextestStatusLine("        FAIL [  16.25ms] demo::bin/cli tests::breaks"), {
+    status: "failed",
+    nativeId: "tests::breaks",
+    target: "demo::bin/cli",
+    durationMs: 16.25,
+  });
+  assert.equal(parseNextestStatusLine("   Compiling demo v0.1.0"), undefined);
+  assert.deepEqual(parseCargoStatusLine("test math::adds ... ok"), {
+    status: "passed",
+    nativeId: "math::adds",
+  });
+  assert.deepEqual(parseCargoStatusLine("test math::later ... ignored"), {
+    status: "skipped",
+    nativeId: "math::later",
+  });
+  assert.deepEqual(
+    parseGoStatusLine(
+      JSON.stringify({
+        Action: "pass",
+        Package: "example.com/demo",
+        Test: "TestAdd",
+        Elapsed: 0.02,
+      }),
+    ),
+    { status: "passed", packagePath: "example.com/demo", nativeId: "TestAdd", durationMs: 20 },
+  );
+  assert.equal(
+    parseGoStatusLine('{"Action":"output","Package":"p","Test":"T","Output":"x"}'),
+    undefined,
+  );
+  assert.deepEqual(buildCargoLocateWorkspaceCommand("/repo/crates/a").args, [
+    "locate-project",
+    "--workspace",
+    "--message-format",
+    "plain",
+  ]);
 });

@@ -207,3 +207,36 @@ function firstFailureLine(output: string): string | undefined {
 function escapeRegex(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
+
+export interface GoStatusEvent {
+  status: "passed" | "failed" | "skipped";
+  packagePath: string;
+  nativeId: string;
+  durationMs?: number;
+}
+
+/** Recognises a finished test on the `go test -json` event stream. */
+export function parseGoStatusLine(line: string): GoStatusEvent | undefined {
+  let event: GoTestEvent;
+  try {
+    event = JSON.parse(line) as GoTestEvent;
+  } catch {
+    return undefined;
+  }
+  if (!event.Package || !event.Test) return undefined;
+  const status =
+    event.Action === "pass"
+      ? "passed"
+      : event.Action === "fail"
+        ? "failed"
+        : event.Action === "skip"
+          ? "skipped"
+          : undefined;
+  if (!status) return undefined;
+  return {
+    status,
+    packagePath: event.Package,
+    nativeId: event.Test,
+    ...(typeof event.Elapsed === "number" ? { durationMs: event.Elapsed * 1000 } : {}),
+  };
+}

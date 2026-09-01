@@ -3,15 +3,21 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import type { TestCase } from "../lib/contracts.ts";
 import {
+  displayableProgressLine,
   beginDirtySourceSession,
   captureTerminalProcessOutput,
   dockStructureFingerprint,
   endDirtySourceSession,
+  formatActivity,
+  formatElapsed,
+  LineSplitter,
   mergeProcessExitCode,
   mutateDockContent,
   registerSourceLifecycleEvents,
   sourceSaveAction,
   terminalProcessOutput,
+  tickRenderPlan,
+  TREE_RENDER_INTERVAL_MS,
   updateDock,
 } from "../lib/runtime.ts";
 
@@ -308,5 +314,64 @@ test("all controller and presentation translation keys exist in the locale file"
   assert.deepEqual(
     [...keys].filter((key) => !(key in locale.en)),
     [],
+  );
+});
+
+test("progress formatting shows counts and elapsed time while an operation runs", () => {
+  assert.equal(formatElapsed(0), "0 s");
+  assert.equal(formatElapsed(12_400), "12 s");
+  assert.equal(formatElapsed(65_000), "1m 05s");
+  assert.equal(formatElapsed(3_720_000), "1h 02m");
+  assert.equal(formatActivity("Running .NET (1/2)", undefined, 1_000), "Running .NET (1/2)");
+  assert.equal(
+    formatActivity("Running .NET (1/2)", { startedAt: 0, completed: 37, total: 240 }, 65_000),
+    "Running .NET (1/2) · 37/240 · 1m 05s",
+  );
+  assert.equal(
+    formatActivity("Discovering tests", { startedAt: 0, completed: 0, total: 0 }, 4_000),
+    "Discovering tests · 4 s",
+  );
+});
+
+test("line splitter reassembles partial chunks into whole lines", () => {
+  const splitter = new LineSplitter();
+  assert.deepEqual(splitter.push("passed A (1ms)\npassed B"), ["passed A (1ms)"]);
+  assert.deepEqual(splitter.push(" (2ms)\r\nfailed C (3ms)\n"), [
+    "passed B (2ms)",
+    "failed C (3ms)",
+  ]);
+  assert.deepEqual(splitter.push("tail"), []);
+  assert.deepEqual(splitter.flush(), ["tail"]);
+  assert.deepEqual(splitter.flush(), []);
+});
+
+test("render ticks send cheap content updates and rebuild the tree at most once per interval", () => {
+  assert.equal(tickRenderPlan(1_000, 0, false), "content");
+  assert.equal(tickRenderPlan(1_000, 900, true), "content");
+  assert.equal(tickRenderPlan(2_000, 900, true), "tree");
+  assert.equal(TREE_RENDER_INTERVAL_MS, 1000);
+});
+
+test("displayableProgressLine shows only lines the dock can explain", () => {
+  assert.equal(
+    displayableProgressLine("passed DoctorRejectsMissingWorkspace (433ms)"),
+    "passed DoctorRejectsMissingWorkspace (433ms)",
+  );
+  assert.equal(
+    displayableProgressLine("  Csls -> /repo/artifacts/bin/Csls/debug/Csls.dll"),
+    "Csls -> /repo/artifacts/bin/Csls/debug/Csls.dll",
+  );
+  assert.equal(displayableProgressLine("   Compiling serde v1.0.0"), "Compiling serde v1.0.0");
+  assert.equal(
+    displayableProgressLine("        PASS [   0.004s] observatory-rust-sample tests::adds"),
+    "PASS [   0.004s] observatory-rust-sample tests::adds",
+  );
+  assert.equal(displayableProgressLine("  Error output"), undefined);
+  assert.equal(displayableProgressLine("    [12:00:01] csls: workspace loaded"), undefined);
+  assert.equal(displayableProgressLine("  Standard output"), undefined);
+  assert.equal(displayableProgressLine('{"Action":"run","Test":"TestAdd"}'), undefined);
+  assert.equal(
+    displayableProgressLine("   at Csls.Tests.Fixture.Run() in Fixture.cs:line 10"),
+    undefined,
   );
 });

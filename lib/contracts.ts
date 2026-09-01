@@ -62,6 +62,8 @@ export interface ProcessSpec {
   /** Optional exact report path the adapter expects the command to create. */
   reportPath?: string;
   reportFormat?: "trx" | "junit" | "cobertura";
+  /** Receives each output line while the process runs, for live progress. */
+  onLine?(line: string, stream: "stdout" | "stderr"): void;
 }
 
 export interface ProcessOutput {
@@ -78,14 +80,28 @@ export interface AdapterContext {
   trusted: boolean;
   /** Authority-local report directory outside the workspace checkout. */
   reportDir?: string;
+  /** Survives between sessions and runs, unlike the report directory. */
+  cacheDir?: string;
   preferNextest?: boolean;
   noBuild?: boolean;
   noRestore?: boolean;
   dotnetVerbosity?: "quiet" | "minimal" | "normal" | "detailed" | "diagnostic";
   readFile(path: string): string | null;
+  /** Writes a file, creating parent directories; false when the host refuses. */
+  writeFile?(path: string, content: string): boolean;
   /** Normalized absolute paths matching a recursive workspace file glob. */
   findFiles(glob: string): Promise<string[]>;
   execute(spec: ProcessSpec): Promise<ProcessOutput>;
+  /** Publishes the tests found so far; the dock shows them before discovery completes. */
+  report?(partial: DiscoverResult): void;
+  /** Applies one result while a run is still executing. */
+  update?(result: TestCase): void;
+  /** Replaces the progress line shown while the adapter works. */
+  progress?(message: string): void;
+  /** Lets the editor render between long synchronous steps such as source scans. */
+  yieldToEditor?(): Promise<void>;
+  /** True once Stop was pressed; adapters should end their loops quietly. */
+  cancelled?(): boolean;
 }
 
 export interface DiscoverResult {

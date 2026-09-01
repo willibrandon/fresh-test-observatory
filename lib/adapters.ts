@@ -2,11 +2,14 @@ import {
   buildCargoCommand,
   buildCargoDocListCommand,
   buildCargoListCommand,
+  buildCargoLocateWorkspaceCommand,
   discoverRustSourceTests,
   parseCargoList,
   parseCargoRun,
+  parseCargoStatusLine,
   parseNextestList,
   parseNextestRun,
+  parseNextestStatusLine,
 } from "./cargo.ts";
 import { parseCobertura } from "./cobertura.ts";
 import type {
@@ -14,17 +17,21 @@ import type {
   AdapterRunResult,
   CoverageResult,
   DiscoverResult,
+  ProcessOutput,
   TestCase,
   TestObservatoryAdapter,
 } from "./contracts.ts";
 import {
+  buildDotnetBuildCommand,
   buildDotnetCommand,
   detectDotnetProject,
   discoverDotnetSourceTests,
   findCoverageAttachment,
   parseDotnetConsoleResults,
   parseDotnetListOutput,
+  parseDotnetProgressLine,
   parseTrx,
+  type DotnetCommandOptions,
   type DotnetProject,
 } from "./dotnet.ts";
 import {
@@ -32,10 +39,11 @@ import {
   discoverGoSourceTests,
   modulePathFromGoMod,
   parseGoCoverProfile,
+  parseGoStatusLine,
   parseGoTestJson,
 } from "./go.ts";
 import { applyRunResults, mergeDiscoveredTests } from "./model.ts";
-import { basename, dirname, isWithin, joinPath, resolvePath } from "./path.ts";
+import { basename, dirname, isWithin, joinPath, pathKey, resolvePath, stem } from "./path.ts";
 import { mergeProcessExitCode } from "./runtime.ts";
 
 export function createBuiltInAdapters(): TestObservatoryAdapter[] {
@@ -44,7 +52,122 @@ export function createBuiltInAdapters(): TestObservatoryAdapter[] {
 
 function createDotnetAdapter(): TestObservatoryAdapter {
   let projects: DotnetProject[] = [];
+  /** Bumped when parsing changes so stale caches from older builds are discarded. */
+  const LISTING_CACHE_VERSION = 2;
   const listingCache = new Map<string, { fingerprint: number; tests: TestCase[] }>();
+  let listingCacheLoadedFrom: string | undefined;
+
+  /** The runner listing survives editor restarts so an unchanged project never rebuilds. */
+  function listingCachePath(context: AdapterContext): string | undefined {
+    const directory = context.cacheDir ?? context.reportDir;
+    return directory ? joinPath(directory, "dotnet-listings.json") : undefined;
+  }
+
+  function loadListingCache(context: AdapterContext): void {
+    const path = listingCachePath(context);
+    if (!path || listingCacheLoadedFrom === path) return;
+    listingCacheLoadedFrom = path;
+    const text = context.readFile(path);
+    if (!text) return;
+    try {
+      const parsed = JSON.parse(text) as {
+        version?: number;
+        projects?: Record<string, { fingerprint: number; tests: TestCase[] }>;
+      };
+      if (parsed.version !== LISTING_CACHE_VERSION || !parsed.projects) return;
+      for (const [project, entry] of Object.entries(parsed.projects)) {
+        if (typeof entry?.fingerprint === "number" && Array.isArray(entry.tests)) {
+          listingCache.set(project, entry);
+        }
+      }
+    } catch {
+      // An unreadable cache only costs one listing.
+    }
+  }
+
+  function saveListingCache(context: AdapterContext): void {
+    const path = listingCachePath(context);
+    if (!path || !context.writeFile) return;
+    context.writeFile(
+      path,
+      JSON.stringify({
+        version: LISTING_CACHE_VERSION,
+        projects: Object.fromEntries(listingCache),
+      }),
+    );
+  }
+  const restoredTargets = new Set<string>();
+
+  function commandOptions(
+    context: AdapterContext,
+    action: DotnetCommandOptions["action"],
+    extra: Partial<DotnetCommandOptions> = {},
+  ): DotnetCommandOptions {
+    return {
+      action,
+      workspaceRoot: context.cwd,
+      ...(context.reportDir ? { reportDir: context.reportDir } : {}),
+      ...(context.noBuild !== undefined ? { noBuild: context.noBuild } : {}),
+      ...(context.noRestore !== undefined ? { noRestore: context.noRestore } : {}),
+      ...(context.dotnetVerbosity ? { verbosity: context.dotnetVerbosity } : {}),
+      ...extra,
+    };
+  }
+
+  /**
+   * Builds every project that needs it with one `dotnet build` per solution or
+   * project, so the later `dotnet test --no-build` calls skip MSBuild almost
+   * entirely. `--no-restore` is tried first because a restore costs more than
+   * the incremental build; the build repeats with a restore only when the SDK
+   * asks for one.
+   */
+  async function build(
+    context: AdapterContext,
+    pending: readonly DotnetProject[],
+  ): Promise<{ ok: Set<string>; output: string }> {
+    const ok = new Set<string>();
+    if (pending.length === 0) return { ok, output: "" };
+    if (context.noBuild) {
+      for (const project of pending) ok.add(project.path);
+      return { ok, output: "" };
+    }
+    const solution = pending.length > 1 ? await solutionPath(context) : undefined;
+    const targets = solution
+      ? [{ target: solution, projects: pending }]
+      : pending.map((project) => ({ target: project.path, projects: [project] }));
+    let output = "";
+    for (const item of targets) {
+      const label = solution
+        ? `Building ${stem(item.target)} (${item.projects.length} test projects)`
+        : `Building ${item.projects[0]!.name}`;
+      context.progress?.(label);
+      let result = await context.execute({
+        ...buildDotnetBuildCommand(item.target, { label, noRestore: true }),
+        onLine: () => {},
+      });
+      if (result.exitCode !== 0 && !context.noRestore && needsRestore(result)) {
+        result = await context.execute({
+          ...buildDotnetBuildCommand(item.target, { label }),
+          onLine: () => {},
+        });
+      }
+      output += `${result.stdout}\n${result.stderr}\n`;
+      if (result.exitCode === 0) {
+        restoredTargets.add(item.target);
+        for (const project of item.projects) ok.add(project.path);
+      }
+    }
+    return { ok, output };
+  }
+
+  async function solutionPath(context: AdapterContext): Promise<string | undefined> {
+    const candidates = (
+      await Promise.all([context.findFiles("**/*.slnx"), context.findFiles("**/*.sln")])
+    )
+      .flat()
+      .filter((path) => pathKey(dirname(path)) === pathKey(context.cwd));
+    return candidates[0];
+  }
 
   return {
     id: "dotnet",
@@ -74,44 +197,72 @@ function createDotnetAdapter(): TestObservatoryAdapter {
           context.findFiles("**/*.vb"),
         ])
       ).flat();
+      const fingerprints = new Map<string, number>();
       let tests: TestCase[] = [];
+      let scanned = 0;
       for (const project of projects) {
         diagnostics.push(...project.diagnostics.map((message) => `${project.name}: ${message}`));
         const projectRoot = dirname(project.path);
-        let projectTests: TestCase[] = [];
         let fingerprint = hashText(JSON.stringify(project));
         for (const path of sourcePaths) {
           if (!isWithin(projectRoot, path)) continue;
           const source = context.readFile(path);
           if (source) {
             fingerprint = hashText(path + "\0" + source, fingerprint);
-            projectTests.push(...discoverDotnetSourceTests(path, source, project));
+            tests.push(...discoverDotnetSourceTests(path, source, project));
+            if (++scanned % SCAN_YIELD_EVERY === 0) await context.yieldToEditor?.();
           }
         }
-        tests.push(...projectTests);
-        if (!context.trusted || project.platform === "unavailable") continue;
+        fingerprints.set(project.path, fingerprint);
+      }
+      // The source scan is enough to draw the tree; runner listings refine it.
+      context.report?.({ tests: [...tests] });
+      if (!context.trusted) return { tests, ...(diagnostics.length > 0 ? { diagnostics } : {}) };
+
+      loadListingCache(context);
+      const pending: DotnetProject[] = [];
+      for (const project of projects) {
+        if (project.platform === "unavailable") continue;
         const cached = listingCache.get(project.path);
-        if (cached?.fingerprint === fingerprint) {
+        if (cached && cached.fingerprint === fingerprints.get(project.path)) {
           tests = mergeWithSourceLocations(tests, cached.tests, project.path);
-          continue;
-        }
-        const spec = buildDotnetCommand(project, {
-          action: "list",
-          workspaceRoot: context.cwd,
-          ...(context.reportDir ? { reportDir: context.reportDir } : {}),
-          ...(context.noBuild !== undefined ? { noBuild: context.noBuild } : {}),
-          ...(context.noRestore !== undefined ? { noRestore: context.noRestore } : {}),
-          ...(context.dotnetVerbosity ? { verbosity: context.dotnetVerbosity } : {}),
-        });
-        const output = await context.execute(spec);
-        if (output.exitCode === 0) {
-          const listed = parseDotnetListOutput(`${output.stdout}\n${output.stderr}`, project);
-          listingCache.set(project.path, { fingerprint, tests: listed });
-          tests = mergeWithSourceLocations(tests, listed, project.path);
         } else {
-          diagnostics.push(`${project.name}: discovery command exited ${output.exitCode}`);
+          pending.push(project);
         }
       }
+      if (pending.length === 0) {
+        return { tests, ...(diagnostics.length > 0 ? { diagnostics } : {}) };
+      }
+      context.report?.({ tests: [...tests] });
+      const built = await build(context, pending);
+      context.progress?.(
+        pending.length === 1
+          ? `Listing ${pending[0]!.name}`
+          : `Listing ${pending.length} .NET test projects`,
+      );
+      await Promise.all(
+        pending.map(async (project) => {
+          if (context.cancelled?.()) return;
+          const output = await context.execute(
+            buildDotnetCommand(
+              project,
+              commandOptions(context, "list", { noBuild: built.ok.has(project.path) }),
+            ),
+          );
+          if (output.exitCode === 0) {
+            const listed = parseDotnetListOutput(`${output.stdout}\n${output.stderr}`, project);
+            listingCache.set(project.path, {
+              fingerprint: fingerprints.get(project.path)!,
+              tests: listed,
+            });
+            saveListingCache(context);
+            tests = mergeWithSourceLocations(tests, listed, project.path);
+            context.report?.({ tests: [...tests] });
+          } else if (!context.cancelled?.()) {
+            diagnostics.push(`${project.name}: discovery command exited ${output.exitCode}`);
+          }
+        }),
+      );
       return { tests, ...(diagnostics.length > 0 ? { diagnostics } : {}) };
     },
     async run(context, request): Promise<AdapterRunResult> {
@@ -119,21 +270,40 @@ function createDotnetAdapter(): TestObservatoryAdapter {
       let results: TestCase[] = [];
       let combinedOutput = "";
       let exitCode = 0;
-      for (const project of projects) {
-        if (project.platform === "unavailable") continue;
+      const targets = projects.filter((project) => {
+        if (project.platform === "unavailable") return false;
         const selected = request.tests.filter((test) => test.project === project.path);
-        if (request.scope !== "workspace" && selected.length === 0) continue;
-        const spec = buildDotnetCommand(project, {
-          action: "run",
-          scope: request.scope,
-          tests: selected,
-          workspaceRoot: context.cwd,
-          ...(context.reportDir ? { reportDir: context.reportDir } : {}),
-          ...(context.noBuild !== undefined ? { noBuild: context.noBuild } : {}),
-          ...(context.noRestore !== undefined ? { noRestore: context.noRestore } : {}),
-          ...(context.dotnetVerbosity ? { verbosity: context.dotnetVerbosity } : {}),
+        return request.scope === "workspace" || selected.length > 0;
+      });
+      const built = await build(context, targets);
+      combinedOutput += built.output;
+      for (const project of targets) {
+        if (context.cancelled?.()) break;
+        const selected = request.tests.filter((test) => test.project === project.path);
+        const spec = buildDotnetCommand(
+          project,
+          commandOptions(context, "run", {
+            scope: request.scope,
+            tests: selected,
+            noBuild: built.ok.has(project.path) || context.noBuild === true,
+          }),
+        );
+        context.progress?.(`Running ${project.name}`);
+        const output = await context.execute({
+          ...spec,
+          onLine: (line) => {
+            const progress = parseDotnetProgressLine(line);
+            if (!progress) return;
+            const match = matchDotnetTest(selected, progress.displayName);
+            if (match) {
+              context.update?.({
+                ...match,
+                status: progress.status,
+                ...(progress.durationMs !== undefined ? { durationMs: progress.durationMs } : {}),
+              });
+            }
+          },
         });
-        const output = await context.execute(spec);
         const text = `${output.stdout}\n${output.stderr}`;
         combinedOutput += `${text}\n`;
         exitCode = mergeProcessExitCode(exitCode, output.exitCode);
@@ -141,7 +311,7 @@ function createDotnetAdapter(): TestObservatoryAdapter {
         const parsed = trx ? parseTrx(trx, project) : parseDotnetConsoleResults(text, project);
         const enriched = applyRunResults(selected, alignDotnetResults(selected, parsed), "dotnet");
         results = applyRunResults(results, enriched);
-        if (parsed.length === 0)
+        if (parsed.length === 0 && !context.cancelled?.())
           diagnostics.push(`${project.name}: no individual results were parsed`);
       }
       return {
@@ -155,19 +325,21 @@ function createDotnetAdapter(): TestObservatoryAdapter {
       const files = [];
       const diagnostics: string[] = [];
       let combinedOutput = "";
-      for (const project of projects) {
-        if (project.platform === "unavailable") continue;
+      const targets = projects.filter((project) => project.platform !== "unavailable");
+      const built = await build(context, targets);
+      combinedOutput += built.output;
+      for (const project of targets) {
+        if (context.cancelled?.()) break;
         const selected = request.tests.filter((test) => test.project === project.path);
-        const spec = buildDotnetCommand(project, {
-          action: "coverage",
-          scope: request.scope,
-          tests: selected,
-          workspaceRoot: context.cwd,
-          ...(context.reportDir ? { reportDir: context.reportDir } : {}),
-          ...(context.noBuild !== undefined ? { noBuild: context.noBuild } : {}),
-          ...(context.noRestore !== undefined ? { noRestore: context.noRestore } : {}),
-          ...(context.dotnetVerbosity ? { verbosity: context.dotnetVerbosity } : {}),
-        });
+        const spec = buildDotnetCommand(
+          project,
+          commandOptions(context, "coverage", {
+            scope: request.scope,
+            tests: selected,
+            noBuild: built.ok.has(project.path) || context.noBuild === true,
+          }),
+        );
+        context.progress?.(`Collecting coverage for ${project.name}`);
         const output = await context.execute(spec);
         const text = `${output.stdout}\n${output.stderr}`;
         combinedOutput += `${text}\n`;
@@ -188,6 +360,30 @@ function createDotnetAdapter(): TestObservatoryAdapter {
   };
 }
 
+function needsRestore(output: ProcessOutput): boolean {
+  return /NETSDK1004|NU1\d{3}|project\.assets\.json|Run a NuGet package restore|--no-restore/i.test(
+    `${output.stdout}\n${output.stderr}`,
+  );
+}
+
+/** Finds the discovered row a runner's display name refers to, parameterized cases included. */
+function matchDotnetTest(selected: readonly TestCase[], displayName: string): TestCase | undefined {
+  const exact = selected.filter(
+    (test) => test.label === displayName || test.nativeId === displayName,
+  );
+  if (exact.length === 1) return exact[0];
+  const suffix = selected.filter((test) => displayName.endsWith(`.${test.nativeId}`));
+  if (suffix.length === 1) return suffix[0];
+  const base = displayName.replace(/\s*\(.*\)$/, "");
+  const parents = selected.filter(
+    (test) => !test.parentId && (test.label === base || test.nativeId.endsWith(`.${base}`)),
+  );
+  return parents.length === 1 ? parents[0] : undefined;
+}
+
+/** Source files scanned between two chances for the editor to render. */
+const SCAN_YIELD_EVERY = 8;
+
 function hashText(value: string, seed = 2_166_136_261): number {
   let hash = seed;
   for (let index = 0; index < value.length; index += 1) {
@@ -204,6 +400,42 @@ function createCargoAdapter(): TestObservatoryAdapter {
   let packages: CargoPackage[] = [];
   const rootsByTestId = new Map<string, string>();
   const nextestByRoot = new Map<string, boolean>();
+  const workspaceByPackageRoot = new Map<string, string>();
+
+  async function workspaceRootFor(context: AdapterContext, pkg: CargoPackage): Promise<string> {
+    const cached = workspaceByPackageRoot.get(pkg.root);
+    if (cached) return cached;
+    const output = await context.execute(buildCargoLocateWorkspaceCommand(pkg.root));
+    const manifest = output.stdout.trim().split(/\r?\n/).at(-1)?.trim();
+    const root =
+      output.exitCode === 0 && manifest && /Cargo\.toml$/.test(manifest)
+        ? dirname(manifest)
+        : pkg.root;
+    workspaceByPackageRoot.set(pkg.root, root);
+    return root;
+  }
+
+  function streamCargoResults(
+    context: AdapterContext,
+    batch: readonly TestCase[],
+    nextest: boolean,
+  ): (line: string) => void {
+    return (line) => {
+      const status = nextest ? parseNextestStatusLine(line) : parseCargoStatusLine(line);
+      if (!status) return;
+      const candidates = batch.filter(
+        (test) =>
+          test.nativeId === status.nativeId &&
+          (!status.target || !test.target || targetsAlign(test.target, status.target)),
+      );
+      if (candidates.length !== 1) return;
+      context.update?.({
+        ...candidates[0]!,
+        status: status.status,
+        ...(status.durationMs !== undefined ? { durationMs: status.durationMs } : {}),
+      });
+    };
+  }
 
   return {
     id: "cargo",
@@ -217,82 +449,165 @@ function createCargoAdapter(): TestObservatoryAdapter {
       rootsByTestId.clear();
       const sourcePaths = await context.findFiles("**/*.rs");
       const diagnostics: string[] = [];
-      let tests: TestCase[] = [];
-      if (context.trusted && context.preferNextest !== false && packages.length > 0) {
-        const probeRoot = packages[0]!.root;
-        const cached = nextestByRoot.get(probeRoot);
-        if (cached === undefined) {
-          const version = await context.execute({
-            command: "cargo",
-            args: ["nextest", "--version"],
-            cwd: probeRoot,
-          });
-          nextestAvailable = version.exitCode === 0;
-          nextestByRoot.set(probeRoot, nextestAvailable);
-        } else {
-          nextestAvailable = cached;
+      const sourceTestsByPackage = new Map<string, TestCase[]>();
+      const doctestPackages = new Set<string>();
+      const testMarkedPackages = new Set<string>();
+      const roots = packages.map((entry) => entry.root);
+      for (const pkg of packages) sourceTestsByPackage.set(pkg.root, []);
+      let scanned = 0;
+      for (const path of sourcePaths) {
+        const root = nearestRoot(path, roots);
+        const pkg = packages.find((entry) => entry.root === root);
+        if (!pkg) continue;
+        const source = context.readFile(path);
+        if (!source) continue;
+        if (++scanned % SCAN_YIELD_EVERY === 0) await context.yieldToEditor?.();
+        if (/^\s*\/\/\/(?:.*```|\s{5}\S)/m.test(source)) doctestPackages.add(pkg.root);
+        if (
+          /#\s*\[\s*(?:cfg\s*\(\s*test\s*\)|test\b|rstest\b|test_case\b|tokio::test\b)/.test(source)
+        ) {
+          testMarkedPackages.add(pkg.root);
         }
-      } else {
-        nextestAvailable = false;
-      }
-      for (const pkg of packages) {
-        let sourceTests: TestCase[] = [];
-        let hasDoctests = false;
-        for (const path of sourcePaths) {
-          if (
-            nearestRoot(
-              path,
-              packages.map((entry) => entry.root),
-            ) !== pkg.root
-          )
-            continue;
-          const source = context.readFile(path);
-          if (!source) continue;
-          if (/^\s*\/\/\/(?:.*```|\s{5}\S)/m.test(source)) hasDoctests = true;
-          sourceTests.push(
+        sourceTestsByPackage
+          .get(pkg.root)!
+          .push(
             ...discoverRustSourceTests(path, source, pkg.root).map((test) =>
               qualifyCargoTest(test, pkg.root, pkg.name),
             ),
           );
-        }
-        if (!context.trusted) {
-          tests.push(...sourceTests);
-          continue;
-        }
-        const output = await context.execute(
-          buildCargoListCommand(pkg.root, nextestAvailable, pkg.name),
-        );
-        const listed = (
-          nextestAvailable
-            ? parseNextestList(output.stdout)
-            : parseCargoList(`${output.stdout}\n${output.stderr}`)
-        ).map((test) => qualifyCargoTest(test, pkg.root, pkg.name));
-        let doctests: TestCase[] = [];
-        if (hasDoctests) {
-          const docOutput = await context.execute(buildCargoDocListCommand(pkg.root, pkg.name));
-          if (docOutput.exitCode === 0) {
-            doctests = parseCargoList(`${docOutput.stdout}\n${docOutput.stderr}`).map((test) => {
-              const qualified = qualifyCargoTest(test, pkg.root, pkg.name);
-              return qualified.source
-                ? {
-                    ...qualified,
-                    source: {
-                      ...qualified.source,
-                      path: resolvePath(pkg.root, qualified.source.path),
-                    },
-                  }
-                : qualified;
+      }
+      const allSourceTests = [...sourceTestsByPackage.values()].flat();
+      context.report?.({ tests: mergeDiscoveredTests([], allSourceTests) });
+      // A crate with no test attribute, test directory, or doctest anywhere in
+      // its sources has nothing to list; compiling it would only cost time.
+      packages = packages.filter(
+        (pkg) =>
+          (sourceTestsByPackage.get(pkg.root)?.length ?? 0) > 0 ||
+          doctestPackages.has(pkg.root) ||
+          testMarkedPackages.has(pkg.root),
+      );
+
+      let tests: TestCase[] = [];
+      if (!context.trusted || packages.length === 0) {
+        tests = allSourceTests;
+      } else {
+        if (context.preferNextest !== false) {
+          const probeRoot = packages[0]!.root;
+          const cached = nextestByRoot.get(probeRoot);
+          if (cached === undefined) {
+            const version = await context.execute({
+              command: "cargo",
+              args: ["nextest", "--version"],
+              cwd: probeRoot,
+              label: "Checking for cargo-nextest",
             });
+            nextestAvailable = version.exitCode === 0;
+            nextestByRoot.set(probeRoot, nextestAvailable);
+          } else {
+            nextestAvailable = cached;
           }
+        } else {
+          nextestAvailable = false;
         }
-        const discovered = mergeWithSourceLocations(sourceTests, [...listed, ...doctests]);
-        tests.push(...(discovered.length > 0 ? discovered : sourceTests));
-        if (output.exitCode !== 0)
-          diagnostics.push(`${pkg.name}: Cargo discovery exited ${output.exitCode}`);
+
+        // Packages in one Cargo workspace are listed together: one compilation
+        // instead of one per package.
+        const workspaces = new Map<string, CargoPackage[]>();
+        for (const pkg of packages) {
+          const workspace = nextestAvailable ? await workspaceRootFor(context, pkg) : pkg.root;
+          const members = workspaces.get(workspace) ?? [];
+          members.push(pkg);
+          workspaces.set(workspace, members);
+        }
+        const listedByPackage = new Map<string, TestCase[]>();
+        let index = 0;
+        for (const [workspace, members] of workspaces) {
+          index += 1;
+          context.progress?.(
+            members.length === 1
+              ? `Listing Rust tests in ${members[0]!.name}`
+              : `Listing Rust tests in ${basename(workspace)} (${members.length} packages, ${index}/${workspaces.size})`,
+          );
+          if (nextestAvailable) {
+            const output = await context.execute(
+              buildCargoListCommand(
+                workspace,
+                true,
+                members.length === 1 ? members[0]!.name : undefined,
+              ),
+            );
+            if (output.exitCode !== 0) {
+              diagnostics.push(`${basename(workspace)}: Cargo discovery exited ${output.exitCode}`);
+            }
+            const byName = new Map(members.map((pkg) => [pkg.name, pkg]));
+            for (const listed of parseNextestList(output.stdout)) {
+              const pkg = listed.project ? byName.get(listed.project) : undefined;
+              if (!pkg) continue;
+              const bucket = listedByPackage.get(pkg.root) ?? [];
+              bucket.push(qualifyCargoTest(listed, pkg.root, pkg.name));
+              listedByPackage.set(pkg.root, bucket);
+            }
+          } else {
+            for (const pkg of members) {
+              const output = await context.execute(
+                buildCargoListCommand(pkg.root, false, pkg.name),
+              );
+              if (output.exitCode !== 0) {
+                diagnostics.push(`${pkg.name}: Cargo discovery exited ${output.exitCode}`);
+              }
+              listedByPackage.set(
+                pkg.root,
+                parseCargoList(`${output.stdout}\n${output.stderr}`).map((test) =>
+                  qualifyCargoTest(test, pkg.root, pkg.name),
+                ),
+              );
+            }
+          }
+          for (const pkg of members) {
+            let doctests: TestCase[] = [];
+            if (doctestPackages.has(pkg.root)) {
+              const docOutput = await context.execute(buildCargoDocListCommand(pkg.root, pkg.name));
+              if (docOutput.exitCode === 0) {
+                doctests = parseCargoList(`${docOutput.stdout}\n${docOutput.stderr}`).map(
+                  (test) => {
+                    const qualified = qualifyCargoTest(test, pkg.root, pkg.name);
+                    return qualified.source
+                      ? {
+                          ...qualified,
+                          source: {
+                            ...qualified.source,
+                            path: resolvePath(pkg.root, qualified.source.path),
+                          },
+                        }
+                      : qualified;
+                  },
+                );
+              }
+            }
+            const sourceTests = sourceTestsByPackage.get(pkg.root) ?? [];
+            const discovered = mergeWithSourceLocations(sourceTests, [
+              ...(listedByPackage.get(pkg.root) ?? []),
+              ...doctests,
+            ]);
+            tests.push(...(discovered.length > 0 ? discovered : sourceTests));
+          }
+          const listedRoots = new Set(tests.map((test) => rootOf(test, packages)));
+          context.report?.({
+            tests: mergeDiscoveredTests(
+              [],
+              [
+                ...tests,
+                ...packages
+                  .filter((pkg) => !listedRoots.has(pkg.root))
+                  .flatMap((pkg) => sourceTestsByPackage.get(pkg.root) ?? []),
+              ],
+            ),
+          });
+        }
       }
       tests = mergeDiscoveredTests([], tests);
       for (const test of tests) {
-        const root = packages.find((pkg) => test.id.startsWith(`cargo:${pkg.root}:`))?.root;
+        const root = rootOf(test, packages);
         if (root) rootsByTestId.set(test.id, root);
       }
       return {
@@ -305,6 +620,7 @@ function createCargoAdapter(): TestObservatoryAdapter {
       let combinedOutput = "";
       let exitCode = 0;
       for (const pkg of packages) {
+        if (context.cancelled?.()) break;
         const selected = request.tests.filter((test) => rootsByTestId.get(test.id) === pkg.root);
         if (selected.length === 0) continue;
         const doctests = selected.filter((test) => test.framework === "rust-doctest");
@@ -319,22 +635,25 @@ function createCargoAdapter(): TestObservatoryAdapter {
         ];
         for (const item of batches) {
           const batch = item.tests;
+          const nextest = nextestAvailable && !item.doctest;
           const spec = buildCargoCommand({
             workspaceRoot: pkg.root,
-            nextest: nextestAvailable && !item.doctest,
+            nextest,
             packageName: pkg.name,
             tests: batch,
             ...(item.doctest ? { doctest: true } : {}),
             ...(context.reportDir ? { reportDir: context.reportDir } : {}),
           });
-          const output = await context.execute(spec);
+          context.progress?.(spec.label ?? `Running Rust tests in ${pkg.name}`);
+          const output = await context.execute({
+            ...spec,
+            onLine: streamCargoResults(context, batch, nextest),
+          });
           const text = `${output.stdout}\n${output.stderr}`;
           combinedOutput += `${text}\n`;
           exitCode = mergeProcessExitCode(exitCode, output.exitCode);
           const requested = new Set(batch.map((test) => test.nativeId));
-          const parsed = (
-            nextestAvailable && !item.doctest ? parseNextestRun(text) : parseCargoRun(text)
-          )
+          const parsed = (nextest ? parseNextestRun(text) : parseCargoRun(text))
             .filter((test) => requested.has(test.nativeId))
             .map((test) => {
               const qualified = qualifyCargoTest(test, pkg.root, pkg.name);
@@ -372,6 +691,7 @@ function createCargoAdapter(): TestObservatoryAdapter {
       const diagnostics: string[] = [];
       let combinedOutput = "";
       for (const pkg of packages) {
+        if (context.cancelled?.()) break;
         const selected = request.tests.filter((test) => rootsByTestId.get(test.id) === pkg.root);
         if (selected.length === 0) continue;
         const spec = buildCargoCommand({
@@ -382,6 +702,7 @@ function createCargoAdapter(): TestObservatoryAdapter {
           coverage: true,
           ...(context.reportDir ? { reportDir: context.reportDir } : {}),
         });
+        context.progress?.(spec.label ?? `Collecting Rust coverage for ${pkg.name}`);
         const output = await context.execute(spec);
         combinedOutput += `${output.stdout}\n${output.stderr}\n`;
         const report = spec.reportPath ? context.readFile(spec.reportPath) : null;
@@ -395,6 +716,10 @@ function createCargoAdapter(): TestObservatoryAdapter {
       };
     },
   };
+}
+
+function rootOf(test: TestCase, packages: readonly { root: string }[]): string | undefined {
+  return packages.find((pkg) => test.id.startsWith(`cargo:${pkg.root}:`))?.root;
 }
 
 function createGoAdapter(): TestObservatoryAdapter {
@@ -414,6 +739,7 @@ function createGoAdapter(): TestObservatoryAdapter {
       modules = await goModules(context);
       rootsByTestId.clear();
       const tests: TestCase[] = [];
+      let scanned = 0;
       for (const path of await context.findFiles("**/*_test.go")) {
         const root = nearestRoot(
           path,
@@ -423,6 +749,7 @@ function createGoAdapter(): TestObservatoryAdapter {
         if (!module) continue;
         const source = context.readFile(path);
         if (!source) continue;
+        if (++scanned % SCAN_YIELD_EVERY === 0) await context.yieldToEditor?.();
         for (const test of discoverGoSourceTests(path, source, module.root, module.modulePath)) {
           const qualified = qualifyGoTest(test, module.root);
           tests.push(qualified);
@@ -436,6 +763,7 @@ function createGoAdapter(): TestObservatoryAdapter {
       let combinedOutput = "";
       let exitCode = 0;
       for (const module of modules) {
+        if (context.cancelled?.()) break;
         const selected = request.tests.filter((test) => rootsByTestId.get(test.id) === module.root);
         if (selected.length === 0) continue;
         // Go's slash-separated -run syntax cannot express an arbitrary set
@@ -445,9 +773,24 @@ function createGoAdapter(): TestObservatoryAdapter {
           ? selected.map((test) => [test])
           : [selected];
         for (const batch of batches) {
-          const output = await context.execute(
-            buildGoCommand(module.root, batch, false, context.reportDir),
-          );
+          const spec = buildGoCommand(module.root, batch, false, context.reportDir);
+          context.progress?.(`Running Go tests in ${module.modulePath}`);
+          const output = await context.execute({
+            ...spec,
+            onLine: (line) => {
+              const status = parseGoStatusLine(line);
+              if (!status) return;
+              const candidates = batch.filter(
+                (test) => test.nativeId === status.nativeId && test.project === status.packagePath,
+              );
+              if (candidates.length !== 1) return;
+              context.update?.({
+                ...candidates[0]!,
+                status: status.status,
+                ...(status.durationMs !== undefined ? { durationMs: status.durationMs } : {}),
+              });
+            },
+          });
           const text = `${output.stdout}\n${output.stderr}`;
           combinedOutput += `${text}\n`;
           exitCode = mergeProcessExitCode(exitCode, output.exitCode);
@@ -468,9 +811,11 @@ function createGoAdapter(): TestObservatoryAdapter {
       const diagnostics: string[] = [];
       let combinedOutput = "";
       for (const module of modules) {
+        if (context.cancelled?.()) break;
         const selected = request.tests.filter((test) => rootsByTestId.get(test.id) === module.root);
         if (selected.length === 0) continue;
         const spec = buildGoCommand(module.root, selected, true, context.reportDir);
+        context.progress?.(`Collecting Go coverage for ${module.modulePath}`);
         const output = await context.execute(spec);
         combinedOutput += `${output.stdout}\n${output.stderr}\n`;
         const profile = spec.reportPath ? context.readFile(spec.reportPath) : null;
@@ -632,7 +977,7 @@ function mergeWithSourceLocations(
             ...listed,
             id: source.id,
             ...(source.source ? { source: source.source } : {}),
-            ...(!listed.suite && source.suite ? { suite: source.suite } : {}),
+            ...(source.suite ? { suite: source.suite } : {}),
           }
         : listed;
     });
@@ -677,7 +1022,7 @@ function mergeWithSourceLocations(
     };
     if (source.status === "skipped") result.status = "skipped";
     if (source.source) result.source = source.source;
-    if (!listed.suite && source.suite) result.suite = source.suite;
+    if (source.suite) result.suite = source.suite;
     return [result];
   });
   const untouched = sourceTests.filter(
@@ -711,7 +1056,7 @@ function alignDotnetResults(
         ...result,
         ...(exact.parentId ? { parentId: exact.parentId } : {}),
         ...(!result.source && exact.source ? { source: exact.source } : {}),
-        ...(!result.suite && exact.suite ? { suite: exact.suite } : {}),
+        ...(exact.suite ? { suite: exact.suite } : {}),
       };
     }
     const nativeMatches = discovered.filter(
@@ -732,7 +1077,7 @@ function alignDotnetResults(
         id: `dotnet:${result.project}:${result.nativeId}`,
         parentId: parent.id,
         ...(!result.source && parent.source ? { source: parent.source } : {}),
-        ...(!result.suite && parent.suite ? { suite: parent.suite } : {}),
+        ...(parent.suite ? { suite: parent.suite } : {}),
       };
     }
     const labelMatches = discovered.filter(
@@ -768,7 +1113,9 @@ function alignDotnetResults(
 }
 
 function dotnetBaseName(nativeId: string): string {
-  return nativeId.replace(/\s*\(.*\)$/, "");
+  // Arguments may contain newlines; `.` must not stop at them or the case
+  // never finds its parent method.
+  return nativeId.replace(/\s*\([\s\S]*\)$/, "");
 }
 
 function testStatusRank(status: TestCase["status"]): number {
@@ -791,6 +1138,7 @@ function alignTestIdentity(result: TestCase, discovered: TestCase): TestCase {
     id: discovered.id,
     nativeId: discovered.nativeId,
     ...(!result.source && discovered.source ? { source: discovered.source } : {}),
+    ...(discovered.suite ? { suite: discovered.suite } : {}),
   };
 }
 

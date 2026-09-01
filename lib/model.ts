@@ -135,6 +135,7 @@ export function summarizeTestsForIds(
 export function formatRunSummary(
   summary: TestSummary,
   translate: MessageFormatter = defaultPresentationMessage,
+  elapsed?: string,
 ): string[] {
   const duration =
     summary.durationMs > 0
@@ -151,7 +152,7 @@ export function formatRunSummary(
         ? "run.many_tests_duration"
         : "run.many_tests";
   return [
-    translate("run.complete"),
+    elapsed ? translate("run.complete_elapsed", { elapsed }) : translate("run.complete"),
     translate("run.counts", {
       passed: String(summary.passed),
       failed: String(summary.failed),
@@ -223,6 +224,7 @@ export function formatCoverageDetails(
 
 const PRESENTATION_ENGLISH: Readonly<Record<string, string>> = {
   "run.complete": "Run complete",
+  "run.complete_elapsed": "Run complete in %{elapsed}",
   "run.counts": "%{passed} passed, %{failed} failed, %{skipped} skipped",
   "run.one_test": "%{total} test",
   "run.many_tests": "%{total} tests",
@@ -292,7 +294,9 @@ export function applyRunResults(
       delete combined.stack;
     }
     if (!result.source && test.source) combined.source = test.source;
-    if (!result.suite && test.suite) combined.suite = test.suite;
+    // Grouping comes from discovery; a result naming the suite differently
+    // (a runner's fully qualified name, say) must not move the row.
+    if (test.suite) combined.suite = test.suite;
     if (!result.project && test.project) combined.project = test.project;
     if (!result.framework && test.framework) combined.framework = test.framework;
     return combined;

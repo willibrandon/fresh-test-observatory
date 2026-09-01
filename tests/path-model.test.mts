@@ -284,6 +284,30 @@ test("mergeDiscoveredTests preserves prior execution state but refreshes source 
   assert.equal(merged[0]!.label, "renamed display");
 });
 
+test("formatRunSummary leads with the wall-clock time when it is known", () => {
+  const summary = {
+    total: 2,
+    passed: 2,
+    failed: 0,
+    skipped: 0,
+    unknown: 0,
+    running: 0,
+    queued: 0,
+    durationMs: 40,
+  };
+  assert.equal(formatRunSummary(summary)[0], "Run complete");
+  assert.equal(formatRunSummary(summary, undefined, "1m 05s")[0], "Run complete in 1m 05s");
+});
+
+test("applyRunResults keeps the discovered grouping when a result names the suite differently", () => {
+  const discovered = sample("Suite.Case", "unknown", 7);
+  const result = sample("Suite.Case", "passed", 7);
+  result.suite = ["project", "Runner", "Qualified", "Suite"];
+  const merged = applyRunResults([discovered], [result], "adapter");
+  assert.deepEqual(merged[0]!.suite, ["project", "suite"]);
+  assert.equal(merged[0]!.status, "passed");
+});
+
 test("applyRunResults preserves discovery location and adds parameterized results", () => {
   const discovered = sample("Suite.Case", "running", 7);
   const result = { ...sample("Suite.Case", "passed", 1), source: undefined } as unknown as TestCase;

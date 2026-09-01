@@ -198,3 +198,88 @@ export function stripTerminalControlSequences(value: string): string {
     .replace(/\x1b\][^\x07]*(?:\x07|\x1b\\)/g, "")
     .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
 }
+
+/** Formats a duration for progress text: "12 s", "1m 05s", "1h 02m". */
+/**
+ * The one runner line worth showing in the dock while a command runs. Only
+ * lines the plugin understands qualify: a finished test, a compile or build
+ * step, a listing count. Everything else a runner prints, such as a test's
+ * captured stderr under an "Error output" heading, stays in the output view.
+ */
+export function displayableProgressLine(line: string): string | undefined {
+  const text = line.trim();
+  if (!text || text.startsWith("{")) return undefined;
+  const patterns = [
+    /^(?:passed|failed|skipped) \S/, // .NET testing platform per-test result
+    /^Running tests from /,
+    /^Discovered \d+ tests?/,
+    /^Test run summary/,
+    /^\S.* -> \S+$/, // MSBuild project -> artifact
+    /^(?:Restored|Restoring|Determining projects to restore)\b/,
+    /^(?:Compiling|Finished|Downloading|Building|Checking|Fresh)\b/, // cargo
+    /^(?:PASS|FAIL|SLOW|START|LEAK|TRY \d+ (?:PASS|FAIL)|FLAKY)\b/, // nextest
+    /^(?:ok|FAIL|---\s+(?:PASS|FAIL|SKIP))\b/, // go test
+  ];
+  return patterns.some((pattern) => pattern.test(text)) ? text : undefined;
+}
+
+export function formatElapsed(milliseconds: number): string {
+  const seconds = Math.max(0, Math.floor(milliseconds / 1000));
+  if (seconds < 60) return `${seconds} s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
+  return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m`;
+}
+
+export interface LiveActivity {
+  startedAt: number;
+  completed: number;
+  total: number;
+}
+
+/** One line of progress: "Running .NET (1/2) · 37/240 · 1m 05s". */
+export function formatActivity(
+  message: string,
+  activity: LiveActivity | undefined,
+  now: number,
+): string {
+  if (!activity) return message;
+  const parts = [message];
+  if (activity.total > 0) parts.push(`${activity.completed}/${activity.total}`);
+  parts.push(formatElapsed(now - activity.startedAt));
+  return parts.join(" · ");
+}
+
+/** Splits streamed chunks into complete lines, keeping a partial tail. */
+export class LineSplitter {
+  private tail = "";
+
+  push(chunk: string): string[] {
+    const text = this.tail + chunk;
+    const lines = text.split(/\r?\n/);
+    this.tail = lines.pop() ?? "";
+    return lines;
+  }
+
+  flush(): string[] {
+    const rest = this.tail;
+    this.tail = "";
+    return rest ? [rest] : [];
+  }
+}
+
+/** How often the full tree is rebuilt while a run streams results. */
+export const TREE_RENDER_INTERVAL_MS = 1000;
+
+/**
+ * Decides what a render tick sends. Cheap widget mutations go every tick so
+ * the elapsed time moves evenly; the full tree, which Fresh reconciles under a
+ * per-frame command budget, is resent at most once per interval.
+ */
+export function tickRenderPlan(
+  now: number,
+  lastTreeRenderAt: number,
+  structureChanged: boolean,
+): "tree" | "content" {
+  return structureChanged && now - lastTreeRenderAt >= TREE_RENDER_INTERVAL_MS ? "tree" : "content";
+}

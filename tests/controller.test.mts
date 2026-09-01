@@ -252,3 +252,74 @@ test("controller routes progress, trust, and empty-selection messages through it
   await trusted.run("selected");
   assert.deepEqual(trusted.snapshot().diagnostics, ["localized:controller.no_selected"]);
 });
+
+test("controller publishes partial discovery before an adapter finishes", async () => {
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const fakePort = port("trusted");
+  const seen: number[] = [];
+  fakePort.changed = () => seen.push(controller.snapshot().tests.length);
+  const fake = adapter({
+    async discover(context) {
+      context.report?.({ tests: [row("early")] });
+      await pending;
+      return { tests: [row("early"), row("late")] };
+    },
+  });
+  const controller = new TestObservatoryController(fakePort, [fake]);
+  const refreshing = controller.refresh();
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.deepEqual(
+    controller.snapshot().tests.map((test) => test.nativeId),
+    ["early"],
+  );
+  assert.equal(controller.snapshot().busy, true);
+  assert.ok(controller.snapshot().activity !== undefined);
+  release();
+  assert.equal(await refreshing, 2);
+  assert.deepEqual(
+    controller.snapshot().tests.map((test) => test.nativeId),
+    ["early", "late"],
+  );
+  assert.ok(seen.includes(1));
+});
+
+test("controller applies streamed results and counts finished tests without re-rendering each one", async () => {
+  let release!: () => void;
+  const pending = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const first = row("first");
+  const second = row("second");
+  const fakePort = port("trusted");
+  const fake = adapter({
+    discover: () => ({ tests: [first, second] }),
+    async run(context, request) {
+      context.update?.({ ...first, status: "passed", durationMs: 4 });
+      await pending;
+      return {
+        tests: request.tests.map((item) => ({ ...item, status: "passed" })),
+        output: "",
+        exitCode: 0,
+      };
+    },
+  });
+  const controller = new TestObservatoryController(fakePort, [fake]);
+  await controller.refresh();
+  const changesBefore = fakePort.changes;
+  const running = controller.run("workspace");
+  await Promise.resolve();
+  await Promise.resolve();
+  const during = controller.snapshot();
+  assert.deepEqual(during.activity && [during.activity.completed, during.activity.total], [1, 2]);
+  assert.equal(during.tests.find((test) => test.id === first.id)?.status, "passed");
+  assert.equal(during.tests.find((test) => test.id === second.id)?.status, "running");
+  assert.ok(fakePort.changes - changesBefore <= 3, "a streamed result does not notify by itself");
+  release();
+  const summary = await running;
+  assert.equal(summary.passed, 2);
+  assert.equal(controller.snapshot().activity, undefined);
+});

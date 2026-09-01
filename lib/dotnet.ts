@@ -165,6 +165,7 @@ export function discoverDotnetSourceTests(
   if (/\.vb$/i.test(path)) return discoverVisualBasicSourceTests(path, source, project);
   const tests: TestCase[] = [];
   const starts = lineStarts(source);
+  const scopes = csharpScopes(source);
   let searchFrom = 0;
   for (;;) {
     const attributeStart = source.indexOf("[", searchFrom);
@@ -180,9 +181,9 @@ export function discoverDotnetSourceTests(
     const declaration = csharpMethodAt(source, block.end);
     if (!declaration) continue;
     const method = declaration.method.replace(/^@/, "");
-    const before = source.slice(0, attributeStart);
-    const namespace = lastCapture(before, /\bnamespace\s+([\w.]+)/g) ?? "";
-    const typePath = activeCsharpTypes(before);
+    const scope = scopes.at(attributeStart);
+    const namespace = scope.namespace;
+    const typePath = scope.types;
     if (typePath.length === 0) continue;
     // CLR test identities use '+' between nested types and '.' before the method.
     const nativeId = [namespace, typePath.join("+"), method].filter(Boolean).join(".");
@@ -193,13 +194,52 @@ export function discoverDotnetSourceTests(
       adapterId: "dotnet",
       framework: project.flavor,
       project: project.path,
-      suite: [project.name, namespace, ...typePath].filter(Boolean),
+      suite: [project.name, ...suiteSegments(project, namespace), ...typePath],
       source: { path, line: lineNumberAt(starts, declaration.offset) },
       status: ignoredAttribute(attrs) ? "skipped" : "unknown",
     });
     searchFrom = declaration.offset + declaration.method.length;
   }
   return tests;
+}
+
+/**
+ * Namespace and enclosing types by position, computed in one pass over the
+ * file. Tests are visited in source order, so lookups only move forward.
+ */
+function csharpScopes(source: string): {
+  at(offset: number): { namespace: string; types: string[] };
+} {
+  const structure = maskCStyleCommentsAndStrings(source);
+  const events = [
+    ...structure.matchAll(
+      /\b(?:class|struct|record(?:\s+(?:class|struct))?)\s+(@?[A-Za-z_]\w*)[^;{}]*\{|\bnamespace\s+([\w.]+)|[{}]/g,
+    ),
+  ];
+  const types: Array<{ name: string; depth: number }> = [];
+  let depth = 0;
+  let namespace = "";
+  let next = 0;
+  return {
+    at(offset) {
+      while (next < events.length && events[next]!.index < offset) {
+        const match = events[next]!;
+        next += 1;
+        if (match[1]) {
+          depth += 1;
+          types.push({ name: match[1].replace(/^@/, ""), depth });
+        } else if (match[2]) {
+          namespace = match[2];
+        } else if (match[0] === "{") {
+          depth += 1;
+        } else {
+          while (types.at(-1)?.depth === depth) types.pop();
+          depth = Math.max(0, depth - 1);
+        }
+      }
+      return { namespace, types: types.map((entry) => entry.name) };
+    },
+  };
 }
 
 function discoverFsharpSourceTests(
@@ -288,7 +328,9 @@ function sourceTest(
     adapterId: "dotnet",
     framework: project.flavor,
     project: project.path,
-    suite: [project.name, ...suite].filter(Boolean),
+    suite: [project.name, ...suiteSegments(project, suite[0] ?? ""), ...suite.slice(1)].filter(
+      Boolean,
+    ),
     source: { path, line },
     status: ignoredAttribute(attributesText) ? "skipped" : "unknown",
   };
@@ -427,25 +469,6 @@ function lineNumberAt(starts: readonly number[], offset: number): number {
 }
 
 /** Tracks the enclosing C# type declarations instead of using the last name. */
-function activeCsharpTypes(source: string): string[] {
-  const structure = maskCStyleCommentsAndStrings(source);
-  const types: Array<{ name: string; depth: number }> = [];
-  let depth = 0;
-  const expression =
-    /\b(?:class|struct|record(?:\s+(?:class|struct))?)\s+(@?[A-Za-z_]\w*)[^;{}]*\{|[{}]/g;
-  for (const match of structure.matchAll(expression)) {
-    if (match[1]) {
-      depth += 1;
-      types.push({ name: match[1].replace(/^@/, ""), depth });
-    } else if (match[0] === "{") {
-      depth += 1;
-    } else {
-      while (types.at(-1)?.depth === depth) types.pop();
-      depth = Math.max(0, depth - 1);
-    }
-  }
-  return types.map((entry) => entry.name);
-}
 
 function activeVisualBasicScopes(source: string): { namespaces: string[]; types: string[] } {
   const namespaces: string[] = [];
@@ -467,76 +490,72 @@ function activeVisualBasicScopes(source: string): { namespaces: string[]; types:
 }
 
 function maskCStyleCommentsAndStrings(source: string): string {
-  let result = "";
-  let index = 0;
-  let blockComment = false;
-  let quote: '"' | "'" | undefined;
-  while (index < source.length) {
-    const current = source[index]!;
-    const next = source[index + 1];
-    if (blockComment) {
-      if (current === "*" && next === "/") {
-        blockComment = false;
-        result += "  ";
-        index += 2;
-      } else {
-        result += current === "\n" ? "\n" : " ";
-        index += 1;
-      }
-    } else if (quote) {
-      if (current === "\\") {
-        result += "  ";
-        index += Math.min(2, source.length - index);
-      } else {
-        result += current === "\n" ? "\n" : " ";
-        index += 1;
-        if (current === quote) quote = undefined;
-      }
-    } else if (current === "/" && next === "/") {
-      const end = source.indexOf("\n", index);
-      const length = (end < 0 ? source.length : end) - index;
-      result += " ".repeat(length);
-      index += length;
-    } else if (current === "/" && next === "*") {
-      blockComment = true;
-      result += "  ";
-      index += 2;
-    } else if (current === '"' || current === "'") {
-      quote = current;
-      result += " ";
-      index += 1;
-    } else {
-      result += current;
-      index += 1;
-    }
-  }
-  return result;
+  // One native pass: comments and string or character literals become spaces
+  // of the same length so offsets and line breaks are preserved.
+  return source.replace(
+    /\/\*[\s\S]*?(?:\*\/|$)|\/\/[^\n]*|"(?:[^"\\\n]|\\.)*(?:"|$)|'(?:[^'\\\n]|\\.)*(?:'|$)/g,
+    (match) => match.replace(/[^\n]/g, " "),
+  );
 }
 
 export function parseDotnetListOutput(output: string, project: DotnetProject): TestCase[] {
-  const lines = stripAnsi(output).split(/\r?\n/);
-  let listing = false;
-  const tests: TestCase[] = [];
+  const lines = stripAnsi(output).split("\n");
+  // Display names may span lines (test data with embedded newlines is printed
+  // verbatim): an indented line starts an entry, an unindented line while one
+  // is open continues its name. MTP indents entries with exactly two spaces.
+  let mode: "off" | "mtp" | "loose" = "off";
+  const ids: string[] = [];
+  let current: string[] | undefined;
+  const finish = (): void => {
+    if (!current) return;
+    while (current.length > 1 && !current.at(-1)!.trim()) current.pop();
+    ids.push(current.join("\n"));
+    current = undefined;
+  };
   for (const raw of lines) {
-    const line = raw.trim();
-    if (/^(?:The following Tests are available|Available tests|Test list):?$/i.test(line)) {
-      listing = true;
+    const line = raw.replace(/\r$/, "");
+    const trimmed = line.trim();
+    if (/^(?:The following Tests are available|Available tests|Test list):?$/i.test(trimmed)) {
+      finish();
+      mode = "loose";
       continue;
     }
-    if (/^Discovered\s+\d+\s+tests?\s+in\s+assembly\b/i.test(line)) {
-      listing = true;
+    if (/^Discovered\s+\d+\s+tests?\s+in\s+assembly\b/i.test(trimmed)) {
+      finish();
+      mode = "mtp";
       continue;
     }
-    if (/^Discovered\s+\d+\s+tests?\.?$/i.test(line)) {
-      listing = false;
+    if (/^Discovered\s+\d+\s+tests?\.?$/i.test(trimmed)) {
+      finish();
+      mode = "off";
       continue;
     }
-    if (!listing || !line || isDotnetNoise(line)) continue;
-    const nativeId = line.replace(/^[-*]\s*/, "").trim();
-    if (!nativeId || /^(?:Passed|Failed|Skipped|Total tests):/i.test(nativeId)) continue;
-    tests.push(testFromNativeId(nativeId, project));
+    if (mode === "off") continue;
+    const startsEntry = mode === "mtp" ? /^ {2}\S/.test(line) : /^\s+\S/.test(line);
+    if (startsEntry) {
+      finish();
+      const nativeId = trimmed.replace(/^[-*]\s*/, "");
+      if (
+        nativeId &&
+        !isDotnetNoise(nativeId) &&
+        !/^(?:Passed|Failed|Skipped|Total tests):/i.test(nativeId)
+      ) {
+        current = [nativeId];
+      }
+      continue;
+    }
+    if (current) {
+      // Footer and runner noise at column 0 ends the open entry rather
+      // than joining a multi-line display name.
+      if (/^(?:Passed|Failed|Skipped|Total tests):/i.test(trimmed) || isDotnetNoise(trimmed)) {
+        finish();
+        continue;
+      }
+      current.push(line);
+    }
   }
-  return tests;
+  finish();
+  return ids.map((nativeId) => testFromNativeId(nativeId, project));
 }
 
 export function buildDotnetCommand(
@@ -577,6 +596,12 @@ export function buildDotnetCommand(
     } else if (project.trxReporter === "xunit") {
       testOptions.push("--report-xunit-trx", "--report-xunit-trx-filename", reportPath);
     }
+    // One line per finished test lets the dock report progress while the run executes.
+    if (project.platform === "mtp") {
+      // `--no-progress` is the spelling every platform version accepts;
+      // `--progress off` is rejected as an invalid command line by older ones.
+      testOptions.push("--output", "detailed", "--no-progress", "--no-ansi");
+    }
   } else if (project.platform === "vstest") {
     dotnetOptions.push("--collect", "XPlat Code Coverage", "--results-directory", resultsDir);
   } else if (project.coverageProvider === "mtp") {
@@ -590,7 +615,9 @@ export function buildDotnetCommand(
     );
   }
 
-  if (options.action !== "list" && options.tests?.length) {
+  // A workspace run executes every test anyway; a filter naming all of them
+  // only bloats the command line (and trips on exotic display names).
+  if (options.action !== "list" && options.tests?.length && options.scope !== "workspace") {
     testOptions.push(...dotnetFilter(project, options.tests));
   }
 
@@ -682,7 +709,7 @@ export function parseTrx(xml: string, project: DotnetProject): TestCase[] {
     const durationMs = parseTrxDuration(attrs.duration);
     tests.push({
       ...base,
-      label: displayName.split(".").at(-1) || displayName,
+      label: dotnetDisplayLabel(displayName),
       status: outcome,
       ...(source ? { source } : {}),
       ...(durationMs !== undefined ? { durationMs } : {}),
@@ -774,16 +801,31 @@ function lastAlternativeCapture(value: string, expression: RegExp): string | und
   return result;
 }
 
+/** Namespace segments for the tree; a namespace equal to the project name adds nothing. */
+function suiteSegments(project: DotnetProject, namespace: string): string[] {
+  return namespace && namespace !== project.name ? [namespace] : [];
+}
+
+/** The display form of a test name: the member for a CLR id, one line otherwise. */
+function dotnetDisplayLabel(name: string): string {
+  if (!/[\s"'()]/.test(name)) return name.split(".").at(-1) || name;
+  return name.replace(/\s*\r?\n\s*/g, " ").trim() || name;
+}
+
 function testFromNativeId(nativeId: string, project: DotnetProject): TestCase {
-  const parts = nativeId.split(".");
+  // Only a plain CLR id is namespace-dotted; a display name with arguments
+  // (spaces, quotes, newlines) must not be split on the dots inside them.
+  const clrId = !/[\s"'()]/.test(nativeId);
+  const parts = clrId ? nativeId.split(".") : [nativeId];
+  const label = dotnetDisplayLabel(nativeId);
   return {
     id: `dotnet:${project.path}:${nativeId}`,
     nativeId,
-    label: parts.at(-1) || nativeId,
+    label,
     adapterId: "dotnet",
     framework: project.flavor,
     project: project.path,
-    suite: [project.name, ...parts.slice(0, -1)],
+    suite: clrId ? [project.name, ...parts.slice(0, -1)] : [project.name],
     status: "unknown",
   };
 }
@@ -838,4 +880,70 @@ function parseHumanDuration(value?: string): number | undefined {
 
 function stripAnsi(value: string): string {
   return value.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+}
+
+export interface DotnetProgressLine {
+  status: "passed" | "failed" | "skipped";
+  displayName: string;
+  durationMs?: number;
+}
+
+/**
+ * Recognises one finished test on a runner's console output. Microsoft.Testing.Platform
+ * with `--output detailed` prints `passed Name (18ms)`; VSTest's console logger prints
+ * `  Passed Name [12 ms]`.
+ */
+export function parseDotnetProgressLine(line: string): DotnetProgressLine | undefined {
+  const text = stripAnsi(line).trim();
+  const mtp = text.match(/^(passed|failed|skipped)\s+(.+?)(?:\s+\(([^()]+)\))?$/);
+  if (mtp) {
+    const durationMs = parseMtpDuration(mtp[3]);
+    return {
+      status: mtp[1] as DotnetProgressLine["status"],
+      displayName: mtp[2]!.trim(),
+      ...(durationMs !== undefined ? { durationMs } : {}),
+    };
+  }
+  const vstest = text.match(/^(Passed|Failed|Skipped)\s+(.+?)(?:\s+\[\s*([^\]]+)\s*\])?$/);
+  if (vstest && !/^!\s/.test(vstest[2]!)) {
+    const durationMs = parseHumanDuration(vstest[3]);
+    return {
+      status: vstest[1]!.toLowerCase() as DotnetProgressLine["status"],
+      displayName: vstest[2]!.trim(),
+      ...(durationMs !== undefined ? { durationMs } : {}),
+    };
+  }
+  return undefined;
+}
+
+export function buildDotnetBuildCommand(
+  target: string,
+  options: { noRestore?: boolean; label?: string } = {},
+): ProcessSpec {
+  return {
+    command: "dotnet",
+    args: ["build", target, ...(options.noRestore ? ["--no-restore"] : [])],
+    cwd: dirname(target),
+    label: options.label ?? `Building ${safeName(target)}`,
+  };
+}
+
+/** Parses "1s 234ms", "18ms", or "2m 05s 003ms" from Microsoft.Testing.Platform output. */
+function parseMtpDuration(value?: string): number | undefined {
+  if (!value) return undefined;
+  let total = 0;
+  let matched = false;
+  for (const part of value.matchAll(/(\d+(?:\.\d+)?)\s*(ms|s|m|h)\b/g)) {
+    matched = true;
+    const amount = Number(part[1]);
+    total +=
+      part[2] === "h"
+        ? amount * 3_600_000
+        : part[2] === "m"
+          ? amount * 60_000
+          : part[2] === "s"
+            ? amount * 1000
+            : amount;
+  }
+  return matched ? total : undefined;
 }

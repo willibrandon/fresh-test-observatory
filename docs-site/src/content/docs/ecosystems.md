@@ -17,11 +17,11 @@ Three runner modes are supported, chosen per project:
 
 Results come from a TRX file. VSTest writes one through its logger. Under Microsoft.Testing.Platform the project needs `Microsoft.Testing.Extensions.TrxReport`, which `MSTest.Sdk` and the `MSTest` package include; xUnit v3 uses its own TRX reporter. When a project lacks the extension, the dock says which package is missing and the run falls back to console output.
 
-Discovery reads C#, F#, and Visual Basic sources for test attributes, including nested classes, then confirms the list with `dotnet test --list-tests`. The listing is cached per project until a source file or the project changes. Parameterized cases from `DataRow`, `Theory`, and similar attributes appear under their method, and the method takes the worst result of its cases. The `noBuild`, `noRestore`, and `dotnetVerbosity` settings are passed through.
+Discovery reads C#, F#, and Visual Basic sources for test attributes, including nested classes, and shows those tests right away. It then builds the test projects once, through the solution when there are several, and lists each project with `dotnet test --list-tests --no-build`, in parallel, so MSBuild runs once instead of once per project. Runs build the same way and pass `--no-build` too. The listing is cached per project, on disk, until a source file or the project changes, so reopening the editor does not build or list again. Parameterized cases from `DataRow`, `Theory`, and similar attributes appear under their method, and the method takes the worst result of its cases. The `noBuild`, `noRestore`, and `dotnetVerbosity` settings are passed through.
 
 ## Rust
 
-Every `Cargo.toml` with a `[package]` section below the workspace root is a package. When cargo-nextest is installed and `preferNextest` is on, listing and runs go through it, and selected tests are matched exactly with a nextest filter expression. Otherwise plain `cargo test` is used with `--exact`, one test per command.
+Every `Cargo.toml` with a `[package]` section below the workspace root is a package. When cargo-nextest is installed and `preferNextest` is on, listing and runs go through it, and selected tests are matched exactly with a nextest filter expression. Otherwise plain `cargo test` is used with `--exact`, one test per command. Packages that share a Cargo workspace are listed with one nextest command, so a workspace compiles once.
 
 Unit tests, integration tests under `tests/`, and doctests are all listed. Integration tests appear under their target, doctests under the file that holds them. Doctests run through `cargo test --doc` since nextest does not execute them. Module paths are derived from the file layout and from `mod` blocks that are still open at the test's position.
 

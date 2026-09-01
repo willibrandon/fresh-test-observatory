@@ -552,3 +552,365 @@ test("Expand All and Collapse All actions return keyboard focus to the test tree
     { kind: "setFocusKey", widgetKey: "test-tree" },
   ]);
 });
+
+test(".NET adapter builds once, lists with --no-build in parallel, and streams run results", async () => {
+  const reportPath = "/tmp/reports/dotnet/App.Tests/App.Tests.trx";
+  const files = {
+    "/repo/global.json": JSON.stringify({ test: { runner: "Microsoft.Testing.Platform" } }),
+    "/repo/tests/App.Tests.csproj": `<Project Sdk="MSTest.Sdk/4.0.2"><PropertyGroup>
+      <TargetFramework>net10.0</TargetFramework>
+    </PropertyGroup></Project>`,
+    "/repo/tests/CalculatorTests.cs": `namespace Demo.Tests;
+public class CalculatorTests { [TestMethod] public void Adds() {} [TestMethod] public void Subtracts() {} }`,
+    [reportPath]: `<TestRun><TestDefinitions>
+      <UnitTest id="a" name="Adds"><TestMethod className="Demo.Tests.CalculatorTests" name="Adds" /></UnitTest>
+      <UnitTest id="s" name="Subtracts"><TestMethod className="Demo.Tests.CalculatorTests" name="Subtracts" /></UnitTest>
+    </TestDefinitions><Results>
+      <UnitTestResult testId="a" testName="Adds" outcome="Passed" duration="00:00:00.005" />
+      <UnitTestResult testId="s" testName="Subtracts" outcome="Failed" duration="00:00:00.007" />
+    </Results></TestRun>`,
+  };
+  const commands: ProcessSpec[] = [];
+  const fake = {
+    ...context(files, () => ({ stdout: "", stderr: "", exitCode: 0 })),
+    reportDir: "/tmp/reports",
+    async execute(spec: ProcessSpec): Promise<ProcessOutput> {
+      commands.push(spec);
+      if (spec.args[0] === "build") return { stdout: "Build succeeded.", stderr: "", exitCode: 0 };
+      if (spec.args.includes("--list-tests")) {
+        return {
+          stdout:
+            "Discovering tests from /repo/bin/App.Tests.dll (net10.0|x64)\n\nDiscovered 2 tests in assembly - /repo/bin/App.Tests.dll (net10.0|x64)\n  Adds\n  Subtracts\n\nDiscovered 2 tests.\n",
+          stderr: "",
+          exitCode: 0,
+        };
+      }
+      for (const line of ["passed Adds (5ms)", "failed Subtracts (7ms)", "  failed: 1"]) {
+        spec.onLine?.(line, "stdout");
+      }
+      return { stdout: "passed Adds (5ms)\nfailed Subtracts (7ms)\n", stderr: "", exitCode: 2 };
+    },
+  };
+  const partials: number[] = [];
+  const adapter = createBuiltInAdapters().find((item) => item.id === "dotnet")!;
+  const discovered = await adapter.discover({
+    ...fake,
+    report: (partial) => partials.push(partial.tests.length),
+  });
+  assert.deepEqual(
+    commands.map((spec) => [spec.args[0], spec.args.includes("--no-build")]),
+    [
+      ["build", false],
+      ["test", true],
+    ],
+    "one build, then a listing that reuses it",
+  );
+  assert.ok(commands[0]!.args.includes("--no-restore"));
+  assert.ok(partials.length >= 2, "source tests were published before the listing finished");
+  assert.deepEqual(
+    discovered.tests.map((item) => [item.nativeId, item.source?.line]),
+    [
+      ["Demo.Tests.CalculatorTests.Adds", 2],
+      ["Demo.Tests.CalculatorTests.Subtracts", 2],
+    ],
+  );
+  assert.deepEqual(
+    discovered.tests.map((item) => item.suite),
+    [
+      ["App.Tests", "Demo.Tests", "CalculatorTests"],
+      ["App.Tests", "Demo.Tests", "CalculatorTests"],
+    ],
+    "a listing without class names keeps the grouping found in source",
+  );
+
+  commands.length = 0;
+  const streamed: string[] = [];
+  const result = await adapter.run(
+    { ...fake, update: (test) => streamed.push(`${test.label}:${test.status}`) },
+    { scope: "workspace", tests: discovered.tests },
+  );
+  assert.deepEqual(
+    commands.map((spec) => [spec.args[0], spec.args.includes("--no-build")]),
+    [
+      ["build", false],
+      ["test", true],
+    ],
+  );
+  assert.ok(commands[1]!.args.includes("--output"), "runs ask for one line per finished test");
+  assert.ok(!commands[1]!.args.includes("--filter"), "a workspace run needs no filter");
+  assert.deepEqual(streamed, ["Adds:passed", "Subtracts:failed"]);
+  assert.deepEqual(
+    result.tests.map((item) => [item.label, item.status, item.durationMs]),
+    [
+      ["Adds", "passed", 5],
+      ["Subtracts", "failed", 7],
+    ],
+  );
+  assert.deepEqual(
+    result.tests.map((item) => item.suite),
+    [
+      ["App.Tests", "Demo.Tests", "CalculatorTests"],
+      ["App.Tests", "Demo.Tests", "CalculatorTests"],
+    ],
+    "results from the report keep the grouping the tree was built with",
+  );
+
+  commands.length = 0;
+  await adapter.discover(fake);
+  assert.deepEqual(commands, [], "unchanged sources reuse the cached listing without a build");
+
+  const stored: Record<string, string> = {};
+  const persisting = {
+    ...fake,
+    cacheDir: "/tmp/cache",
+    writeFile(path: string, content: string): boolean {
+      stored[path] = content;
+      return true;
+    },
+  };
+  commands.length = 0;
+  const fresh = createBuiltInAdapters().find((item) => item.id === "dotnet")!;
+  await fresh.discover(persisting);
+  assert.equal(commands.length, 2, "a new adapter instance builds and lists once");
+  assert.deepEqual(Object.keys(stored), ["/tmp/cache/dotnet-listings.json"]);
+  Object.assign(files, stored);
+  commands.length = 0;
+  const restarted = createBuiltInAdapters().find((item) => item.id === "dotnet")!;
+  const afterRestart = await restarted.discover(persisting);
+  assert.deepEqual(commands, [], "the listing written to disk serves the next editor session");
+  assert.equal(afterRestart.tests.length, 2);
+});
+
+test(".NET adapter repeats the build with a restore only when the SDK asks for one", async () => {
+  const files = {
+    "/repo/tests/App.Tests.csproj": `<Project Sdk="Microsoft.NET.Sdk"><ItemGroup>
+      <PackageReference Include="MSTest.TestFramework" Version="4.0.0"/>
+      <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.0.0"/>
+    </ItemGroup></Project>`,
+    "/repo/tests/CalculatorTests.cs": `namespace Demo.Tests;
+public class CalculatorTests { [TestMethod] public void Adds() {} }`,
+  };
+  const commands: ProcessSpec[] = [];
+  const fake = context(files, (spec) => {
+    commands.push(spec);
+    if (spec.args[0] === "build" && spec.args.includes("--no-restore")) {
+      return {
+        stdout: "",
+        stderr:
+          "error NETSDK1004: Assets file 'project.assets.json' not found. Run a NuGet package restore",
+        exitCode: 1,
+      };
+    }
+    if (spec.args[0] === "build") return { stdout: "", stderr: "", exitCode: 0 };
+    return {
+      stdout: "The following Tests are available:\n    Demo.Tests.CalculatorTests.Adds\n",
+      stderr: "",
+      exitCode: 0,
+    };
+  });
+  const adapter = createBuiltInAdapters().find((item) => item.id === "dotnet")!;
+  const discovered = await adapter.discover(fake);
+  assert.deepEqual(
+    commands.map((spec) => [spec.args[0], spec.args.includes("--no-restore")]),
+    [
+      ["build", true],
+      ["build", false],
+      ["test", false],
+    ],
+  );
+  assert.ok(commands[2]!.args.includes("--no-build"), "listing reuses the build just made");
+  assert.equal(discovered.tests.length, 1);
+});
+
+test(".NET adapter run stops between projects once Stop is pressed", async () => {
+  const files = {
+    "/repo/global.json": JSON.stringify({ test: { runner: "Microsoft.Testing.Platform" } }),
+    "/repo/a/A.Tests.csproj": `<Project Sdk="MSTest.Sdk/4.0.2" />`,
+    "/repo/a/ATests.cs": `namespace A.Tests;
+public class ATests { [TestMethod] public void One() {} }`,
+    "/repo/b/B.Tests.csproj": `<Project Sdk="MSTest.Sdk/4.0.2" />`,
+    "/repo/b/BTests.cs": `namespace B.Tests;
+public class BTests { [TestMethod] public void Two() {} }`,
+  };
+  const commands: ProcessSpec[] = [];
+  let stopped = false;
+  const fake = {
+    ...context(files, () => ({ stdout: "", stderr: "", exitCode: 0 })),
+    cancelled: () => stopped,
+    async execute(spec: ProcessSpec): Promise<ProcessOutput> {
+      commands.push(spec);
+      if (spec.args[0] === "build") return { stdout: "Build succeeded.", stderr: "", exitCode: 0 };
+      if (spec.args.includes("--list-tests")) {
+        const name = spec.args.some((arg) => arg.includes("/a/")) ? "One" : "Two";
+        return {
+          stdout: `Discovering tests from /repo/bin/x.dll (net10.0|x64)\n\n  ${name}\n\nDiscovered 1 tests.\n`,
+          stderr: "",
+          exitCode: 0,
+        };
+      }
+      stopped = true;
+      return { stdout: "passed One (5ms)", stderr: "", exitCode: 137 };
+    },
+  };
+  const adapter = createBuiltInAdapters().find((item) => item.id === "dotnet")!;
+  const discovered = await adapter.discover(fake);
+  assert.equal(discovered.tests.length, 2);
+  commands.length = 0;
+  const result = await adapter.run(fake, { scope: "workspace", tests: discovered.tests });
+  assert.deepEqual(
+    commands.map((spec) => spec.args[0]),
+    ["build", "build", "test"],
+    "the second project never runs after Stop",
+  );
+  assert.deepEqual(result.diagnostics ?? [], [], "a stopped run adds no noise diagnostics");
+});
+
+test(".NET adapter builds a root solution once when several projects need listing", async () => {
+  const files = {
+    "/repo/App.slnx": "<Solution />",
+    "/repo/a/A.Tests.csproj": `<Project Sdk="MSTest.Sdk/4.0.2" />`,
+    "/repo/b/B.Tests.csproj": `<Project Sdk="MSTest.Sdk/4.0.2" />`,
+    "/repo/a/ATests.cs": `namespace A; public class ATests { [TestMethod] public void One() {} }`,
+    "/repo/b/BTests.cs": `namespace B; public class BTests { [TestMethod] public void Two() {} }`,
+  };
+  const commands: ProcessSpec[] = [];
+  const base = context(files, () => ({ stdout: "", stderr: "", exitCode: 0 }));
+  const fake: AdapterContext = {
+    ...base,
+    async findFiles(glob) {
+      if (glob === "**/*.slnx") return ["/repo/App.slnx"];
+      return base.findFiles(glob);
+    },
+    async execute(spec) {
+      commands.push(spec);
+      if (spec.args[0] === "build") return { stdout: "", stderr: "", exitCode: 0 };
+      const name = spec.args.includes("/repo/a/A.Tests.csproj") ? "A.ATests.One" : "B.BTests.Two";
+      return {
+        stdout: `The following Tests are available:\n    ${name}\n`,
+        stderr: "",
+        exitCode: 0,
+      };
+    },
+  };
+  const adapter = createBuiltInAdapters().find((item) => item.id === "dotnet")!;
+  const discovered = await adapter.discover(fake);
+  assert.deepEqual(
+    commands.filter((spec) => spec.args[0] === "build").map((spec) => spec.args[1]),
+    ["/repo/App.slnx"],
+  );
+  assert.equal(commands.filter((spec) => spec.args.includes("--list-tests")).length, 2);
+  assert.deepEqual(
+    discovered.tests.map((item) => item.nativeId),
+    ["A.ATests.One", "B.BTests.Two"],
+  );
+});
+
+test("Cargo adapter lists a shared workspace once for several packages", async () => {
+  const files = {
+    "/repo/Cargo.toml": '[workspace]\nmembers = ["a", "b"]\n',
+    "/repo/a/Cargo.toml": '[package]\nname = "a"\nversion = "0.1.0"\n',
+    "/repo/b/Cargo.toml": '[package]\nname = "b"\nversion = "0.1.0"\n',
+    "/repo/a/src/lib.rs": "#[test]\nfn adds() {}\n",
+    "/repo/b/src/lib.rs": "#[test]\nfn subtracts() {}\n",
+  };
+  const commands: ProcessSpec[] = [];
+  const fake = context(files, (spec) => {
+    commands.push(spec);
+    if (spec.args[0] === "nextest" && spec.args[1] === "--version") {
+      return { stdout: "cargo-nextest 0.9", stderr: "", exitCode: 0 };
+    }
+    if (spec.args[0] === "locate-project") {
+      return { stdout: "/repo/Cargo.toml\n", stderr: "", exitCode: 0 };
+    }
+    if (spec.args[0] === "nextest" && spec.args[1] === "list") {
+      return {
+        stdout: JSON.stringify({
+          "rust-suites": {
+            "a::lib": { "package-name": "a", testcases: { adds: {} } },
+            "b::lib": { "package-name": "b", testcases: { subtracts: {} } },
+          },
+        }),
+        stderr: "",
+        exitCode: 0,
+      };
+    }
+    return { stdout: "", stderr: "", exitCode: 0 };
+  });
+  const adapter = createBuiltInAdapters().find((item) => item.id === "cargo")!;
+  const discovered = await adapter.discover(fake);
+  const listings = commands.filter((spec) => spec.args[0] === "nextest" && spec.args[1] === "list");
+  assert.equal(listings.length, 1);
+  assert.equal(listings[0]!.cwd, "/repo");
+  assert.ok(listings[0]!.args.includes("--workspace"));
+  assert.deepEqual(
+    discovered.tests.map((item) => [item.project, item.nativeId, item.source?.path]),
+    [
+      ["a", "adds", "/repo/a/src/lib.rs"],
+      ["b", "subtracts", "/repo/b/src/lib.rs"],
+    ],
+  );
+});
+
+test("Go adapter streams results as go test emits them", async () => {
+  const files = {
+    "/repo/go.mod": "module example.com/demo\n\ngo 1.24\n",
+    "/repo/calc_test.go":
+      "package demo\n\nfunc TestAdd(t *testing.T) {}\nfunc TestSub(t *testing.T) {}\n",
+  };
+  const events = [
+    { Action: "pass", Package: "example.com/demo", Test: "TestAdd", Elapsed: 0.01 },
+    { Action: "fail", Package: "example.com/demo", Test: "TestSub", Elapsed: 0.02 },
+  ].map((event) => JSON.stringify(event));
+  const fake = context(files, (spec) => {
+    for (const line of events) spec.onLine?.(line, "stdout");
+    return { stdout: events.join("\n"), stderr: "", exitCode: 1 };
+  });
+  const streamed: string[] = [];
+  const adapter = createBuiltInAdapters().find((item) => item.id === "go")!;
+  const discovered = await adapter.discover(fake);
+  await adapter.run(
+    { ...fake, update: (test) => streamed.push(`${test.nativeId}:${test.status}`) },
+    { scope: "workspace", tests: discovered.tests },
+  );
+  assert.deepEqual(streamed, ["TestAdd:passed", "TestSub:failed"]);
+});
+
+test("Cargo adapter does not compile a package that has no tests at all", async () => {
+  const files = {
+    "/repo/editors/zed/Cargo.toml": '[package]\nname = "csls-zed"\nversion = "0.1.0"\n',
+    "/repo/editors/zed/src/lib.rs": "pub fn extension() {}\n",
+    "/repo/core/Cargo.toml": '[package]\nname = "core"\nversion = "0.1.0"\n',
+    "/repo/core/src/lib.rs": "#[cfg(test)]\nmod tests {\n  #[test]\n  fn adds() {}\n}\n",
+  };
+  const commands: ProcessSpec[] = [];
+  const fake = context(files, (spec) => {
+    commands.push(spec);
+    if (spec.args[0] === "nextest" && spec.args[1] === "--version") {
+      return { stdout: "cargo-nextest 0.9", stderr: "", exitCode: 0 };
+    }
+    if (spec.args[0] === "locate-project")
+      return { stdout: spec.cwd + "/Cargo.toml\n", stderr: "", exitCode: 0 };
+    if (spec.args[0] === "nextest" && spec.args[1] === "list") {
+      return {
+        stdout: JSON.stringify({
+          "rust-suites": {
+            "core::lib": { "package-name": "core", testcases: { "tests::adds": {} } },
+          },
+        }),
+        stderr: "",
+        exitCode: 0,
+      };
+    }
+    return { stdout: "", stderr: "", exitCode: 0 };
+  });
+  const adapter = createBuiltInAdapters().find((item) => item.id === "cargo")!;
+  const discovered = await adapter.discover(fake);
+  assert.ok(
+    commands.every((spec) => spec.cwd !== "/repo/editors/zed"),
+    "no cargo command runs in the test-less package",
+  );
+  assert.deepEqual(
+    discovered.tests.map((item) => [item.project, item.nativeId]),
+    [["core", "tests::adds"]],
+  );
+});

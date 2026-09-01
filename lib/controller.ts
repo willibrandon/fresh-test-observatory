@@ -20,6 +20,7 @@ import {
   workspaceDiscoveryIsCurrent,
 } from "./model.ts";
 import { pathKey } from "./path.ts";
+import type { LiveActivity } from "./runtime.ts";
 
 export interface ObservatoryPort {
   workspaceRoot(): string;
@@ -45,6 +46,8 @@ export interface ObservatorySnapshot {
   busy: boolean;
   cancelled: boolean;
   progress: string;
+  /** Present while an operation runs: its start time and streamed completion counts. */
+  activity?: LiveActivity;
   discoveryRoot?: string;
   summaryTestIds?: ReadonlySet<string>;
   focusedTestId?: string;
@@ -65,6 +68,7 @@ export class TestObservatoryController {
   private cancelled = false;
   private cancelRequested = false;
   private progressMessage = "";
+  private activity: LiveActivity | undefined;
   private discoveryRoot: string | undefined;
   private summaryTestIds: ReadonlySet<string> | undefined;
   private focusedTestId: string | undefined;
@@ -84,6 +88,7 @@ export class TestObservatoryController {
       busy: this.busy,
       cancelled: this.cancelled,
       progress: this.progressMessage,
+      ...(this.activity ? { activity: { ...this.activity } } : {}),
       ...(this.discoveryRoot ? { discoveryRoot: this.discoveryRoot } : {}),
       ...(this.summaryTestIds ? { summaryTestIds: this.summaryTestIds } : {}),
       ...(this.focusedTestId ? { focusedTestId: this.focusedTestId } : {}),
@@ -160,10 +165,21 @@ export class TestObservatoryController {
     if (this.busy) return this.tests.length;
     this.beginOperation(this.text("controller.discovering"));
     try {
-      const context = this.port.createContext();
-      const root = context.cwd;
+      const baseContext = this.port.createContext();
+      const root = baseContext.cwd;
+      const previous = workspaceDiscoveryIsCurrent(this.discoveryRoot, root) ? this.tests : [];
+      const imported = this.tests.filter((test) => this.reportOnlyAdapterIds.has(test.adapterId));
       const detected = new Set<string>();
-      const discovered: TestCase[] = [];
+      const discoveredByAdapter = new Map<string, readonly TestCase[]>();
+      // Adapters publish what they have as soon as they have it: source scans
+      // arrive in milliseconds, runner listings later. Each publication renders.
+      const publish = (): void => {
+        this.tests = mergeDiscoveredTests(previous, [
+          ...[...discoveredByAdapter.values()].flat(),
+          ...imported,
+        ]);
+        this.notify();
+      };
       const enabled = this.orderedAdapters().filter((adapter) => this.isEnabled(adapter.id));
       for (let index = 0; index < enabled.length; index += 1) {
         const adapter = enabled[index]!;
@@ -176,7 +192,7 @@ export class TestObservatoryController {
               total: String(enabled.length),
             }),
           );
-          if (!(await adapter.detect(context))) continue;
+          if (!(await adapter.detect(baseContext))) continue;
           detected.add(adapter.id);
           this.setProgress(
             this.text("controller.discovering_adapter", {
@@ -185,9 +201,19 @@ export class TestObservatoryController {
               total: String(enabled.length),
             }),
           );
+          const context: AdapterContext = {
+            ...baseContext,
+            report: (partial) => {
+              discoveredByAdapter.set(adapter.id, partial.tests);
+              publish();
+            },
+            progress: (message) => this.setProgress(message),
+            cancelled: () => this.cancelRequested,
+          };
           const result = await adapter.discover(context);
-          discovered.push(...result.tests);
+          discoveredByAdapter.set(adapter.id, result.tests);
           if (result.diagnostics) this.diagnostics.push(...result.diagnostics);
+          publish();
         } catch (error) {
           this.diagnostics.push(
             this.text("controller.adapter_error", {
@@ -204,9 +230,7 @@ export class TestObservatoryController {
         this.diagnostics = [this.text("controller.workspace_changed")];
         return 0;
       }
-      const previous = workspaceDiscoveryIsCurrent(this.discoveryRoot, root) ? this.tests : [];
-      const imported = this.tests.filter((test) => this.reportOnlyAdapterIds.has(test.adapterId));
-      this.tests = mergeDiscoveredTests(previous, [...discovered, ...imported]);
+      publish();
       this.discoveryRoot = root;
       this.activeAdapterIds.clear();
       for (const id of detected) this.activeAdapterIds.add(id);
@@ -255,9 +279,17 @@ export class TestObservatoryController {
         .map((test) => test.id),
     );
     this.tests = markTests(this.tests, runningIds, "running");
+    this.activity = { startedAt: Date.now(), completed: 0, total: runningIds.size };
     this.notify();
     try {
-      const context = this.port.createContext();
+      const baseContext = this.port.createContext();
+      const completedIds = new Set<string>();
+      const context: AdapterContext = {
+        ...baseContext,
+        update: (result) => this.applyStreamedResult(result, runningIds, completedIds),
+        progress: (message) => this.setProgress(message),
+        cancelled: () => this.cancelRequested,
+      };
       const runnableAdapterIds = new Set(selection.map((test) => test.adapterId));
       for (const adapterId of runnableAdapterIds) {
         if (this.reportOnlyAdapterIds.has(adapterId) || !this.activeAdapterIds.has(adapterId)) {
@@ -293,6 +325,7 @@ export class TestObservatoryController {
           this.diagnostics.push(message);
           this.failTests(adapterTests, message);
         }
+        this.refreshCompletedCount(runningIds);
         this.notify();
       }
     } finally {
@@ -321,7 +354,11 @@ export class TestObservatoryController {
     this.beginOperation(this.text("controller.collecting_coverage"));
     const files: CoverageFile[] = [];
     try {
-      const context = this.port.createContext();
+      const context: AdapterContext = {
+        ...this.port.createContext(),
+        progress: (message) => this.setProgress(message),
+        cancelled: () => this.cancelRequested,
+      };
       const coverageAdapters = this.orderedAdapters().filter(
         (adapter) =>
           this.isEnabled(adapter.id) &&
@@ -400,6 +437,37 @@ export class TestObservatoryController {
     }
   }
 
+  /**
+   * Applies one live result. Streamed results only change state; the host
+   * renders on its own timer, so a burst of results never floods the dock.
+   */
+  private applyStreamedResult(
+    result: TestCase,
+    runningIds: ReadonlySet<string>,
+    completedIds: Set<string>,
+  ): void {
+    const matched =
+      this.tests.find((test) => test.id === result.id) ??
+      this.tests.find(
+        (test) =>
+          test.adapterId === result.adapterId &&
+          test.nativeId === result.nativeId &&
+          runningIds.has(test.id),
+      );
+    this.tests = applyRunResults(this.tests, [matched ? { ...result, id: matched.id } : result]);
+    if (matched && runningIds.has(matched.id) && isConclusive(result.status)) {
+      completedIds.add(matched.id);
+    }
+    if (this.activity) this.activity.completed = completedIds.size;
+  }
+
+  private refreshCompletedCount(runningIds: ReadonlySet<string>): void {
+    if (!this.activity) return;
+    this.activity.completed = this.tests.filter(
+      (test) => runningIds.has(test.id) && isConclusive(test.status),
+    ).length;
+  }
+
   private failTests(selection: readonly TestCase[], message: string): void {
     const ids = new Set(selection.map((test) => test.id));
     this.tests = this.tests.map((test) =>
@@ -413,12 +481,14 @@ export class TestObservatoryController {
     this.cancelRequested = false;
     this.diagnostics = [];
     this.outputs = [];
+    this.activity = { startedAt: Date.now(), completed: 0, total: 0 };
     this.setProgress(progress);
   }
 
   private endOperation(): void {
     this.busy = false;
     this.progressMessage = "";
+    this.activity = undefined;
     this.notify();
   }
 
@@ -457,6 +527,10 @@ export class TestObservatoryController {
 
 export function isTrustedWorkspace(level: string): boolean {
   return level === "trusted";
+}
+
+function isConclusive(status: TestCase["status"]): boolean {
+  return status === "passed" || status === "failed" || status === "skipped";
 }
 
 function validAdapter(adapter: TestObservatoryAdapter): boolean {

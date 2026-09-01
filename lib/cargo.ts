@@ -324,7 +324,7 @@ export function buildCargoCommand(options: CargoOptions): ProcessSpec {
               ...packageArgs,
               "--all-targets",
               "--status-level",
-              "none",
+              "all",
               "--final-status-level",
               "all",
             ]
@@ -334,7 +334,7 @@ export function buildCargoCommand(options: CargoOptions): ProcessSpec {
               ...packageArgs,
               "--all-targets",
               "--status-level",
-              "none",
+              "all",
               "--final-status-level",
               "all",
               "-E",
@@ -606,4 +606,53 @@ function recordAt(
 function stringAt(value: Record<string, unknown>, key: string): string | undefined {
   const candidate = value[key];
   return typeof candidate === "string" ? candidate : undefined;
+}
+
+export interface CargoStatusLine {
+  status: "passed" | "failed" | "skipped";
+  nativeId: string;
+  target?: string;
+  durationMs?: number;
+}
+
+/** Recognises one finished test on nextest's live status stream. */
+export function parseNextestStatusLine(line: string): CargoStatusLine | undefined {
+  const match = stripAnsi(line).match(
+    /^\s*(PASS|FAIL|SKIP|SLOW|LEAK|FLAKY|TIMEOUT)\s+\[\s*([^\]]*)\]\s+(?:\([^)]*\)\s+)?(\S+)\s+(.+?)\s*$/,
+  );
+  if (!match) return undefined;
+  const kind = match[1]!.toUpperCase();
+  const target = match[3]!.includes("::") ? match[3] : undefined;
+  const durationMs = parseNextestDuration(match[2]);
+  return {
+    status:
+      kind === "PASS" || kind === "SLOW" || kind === "FLAKY"
+        ? "passed"
+        : kind === "SKIP"
+          ? "skipped"
+          : "failed",
+    nativeId: match[4]!.trim(),
+    ...(target ? { target } : {}),
+    ...(durationMs !== undefined ? { durationMs } : {}),
+  };
+}
+
+/** Recognises one finished test on libtest's pretty output. */
+export function parseCargoStatusLine(line: string): CargoStatusLine | undefined {
+  const match = line.match(/^test[ \t]+(.+?)[ \t]+\.\.\.[ \t]+(ok|FAILED|ignored)(?:[ \t].*)?$/);
+  if (!match) return undefined;
+  return {
+    status: match[2] === "ok" ? "passed" : match[2] === "FAILED" ? "failed" : "skipped",
+    nativeId: match[1]!.trim(),
+  };
+}
+
+/** Prints the Cargo workspace root that owns a package, without building anything. */
+export function buildCargoLocateWorkspaceCommand(packageRoot: string): ProcessSpec {
+  return {
+    command: "cargo",
+    args: ["locate-project", "--workspace", "--message-format", "plain"],
+    cwd: packageRoot,
+    label: "Locating Cargo workspace",
+  };
 }

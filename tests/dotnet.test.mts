@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { TestCase } from "../lib/contracts.ts";
 import {
+  buildDotnetBuildCommand,
   buildDotnetCommand,
   detectDotnetProject,
   discoverDotnetSourceTests,
@@ -9,6 +10,7 @@ import {
   findCoverageAttachment,
   parseDotnetConsoleResults,
   parseDotnetListOutput,
+  parseDotnetProgressLine,
   parseTrx,
   type DotnetProject,
 } from "../lib/dotnet.ts";
@@ -113,6 +115,87 @@ public class CalculatorTests
       ["Demo.Tests.CalculatorTests.Adds", "unknown", 5],
       ["Demo.Tests.CalculatorTests.Subtracts", "skipped", 8],
       ["Demo.Tests.CalculatorTests.Divides", "unknown", 11],
+    ],
+  );
+});
+
+test("parseTrx keeps display names with arguments intact", () => {
+  const detected = project(`<Project Sdk="MSTest.Sdk/4.0.0" />`);
+  const xml = `<TestRun><TestDefinitions>
+    <UnitTest id="z" name="ZedOpens (&quot;var x;&quot;,&quot;Dictionary.cs&quot;,null)">
+      <TestMethod className="Demo.Tests.ZedTests" name="ZedOpens" /></UnitTest>
+  </TestDefinitions><Results>
+    <UnitTestResult testId="z" testName="ZedOpens (&quot;var x;&quot;,&quot;Dictionary.cs&quot;,null)" outcome="Passed" duration="00:00:00.005" />
+  </Results></TestRun>`;
+  const [result] = parseTrx(xml, detected);
+  assert.equal(result?.label, 'ZedOpens ("var x;","Dictionary.cs",null)');
+  assert.deepEqual(result?.suite, ["App.Tests", "Demo", "Tests", "ZedTests"]);
+});
+
+test("parseDotnetListOutput folds multi-line display names into one test", () => {
+  const detected = project(`<Project Sdk="MSTest.Sdk/4.0.0" />`);
+  const output = [
+    "Discovering tests from /repo/bin/App.Tests.dll (net10.0|x64)",
+    "",
+    "Discovered 4 tests in assembly - /repo/bin/App.Tests.dll (net10.0|x64)",
+    "  ConcurrentPullDiagnosticsShareProjectAnalysis",
+    '  WorkerRejectsMalformedHeaders ("Content-Length: 1\r',
+    "Content-Length: 1\r",
+    "\r",
+    '","duplicate Content-Length headers")',
+    '  WorkerRejectsMalformedHeaders ("Content-Length: nope\r',
+    "\r",
+    '","Content-Length value is invalid")',
+    '  ZedOpens ("var x = 1;","Dictionary","class Dictionary","Dictionary.cs",null)',
+    "",
+    "Discovered 4 tests.",
+    "",
+  ].join("\n");
+  const tests = parseDotnetListOutput(output, detected);
+  assert.equal(tests.length, 4);
+  assert.deepEqual(
+    tests.map((item) => item.label),
+    [
+      "ConcurrentPullDiagnosticsShareProjectAnalysis",
+      'WorkerRejectsMalformedHeaders ("Content-Length: 1 Content-Length: 1 ","duplicate Content-Length headers")',
+      'WorkerRejectsMalformedHeaders ("Content-Length: nope ","Content-Length value is invalid")',
+      'ZedOpens ("var x = 1;","Dictionary","class Dictionary","Dictionary.cs",null)',
+    ],
+  );
+  assert.ok(
+    tests.every((item) => item.suite?.length === 1),
+    "display names with arguments are not split into namespaces",
+  );
+});
+
+test("discoverDotnetSourceTests ignores braces and keywords inside strings and comments", () => {
+  const detected = project(`<Project Sdk="MSTest.Sdk/4.0.0" />`);
+  const source = `namespace Demo.Tests
+{
+  public class Outer
+  {
+    public class Inner
+    {
+      // class Fake {
+      [TestMethod]
+      public void First() { var text = "class Bogus { }"; var brace = '{'; }
+    }
+    /* } */
+    [TestMethod]
+    public void Second() { }
+  }
+}
+namespace Other.Tests
+{
+  public class Late { [Fact] public void Third() { } }
+}`;
+  const tests = discoverDotnetSourceTests("/repo/tests/ScopeTests.cs", source, detected);
+  assert.deepEqual(
+    tests.map((item) => [item.nativeId, item.suite]),
+    [
+      ["Demo.Tests.Outer+Inner.First", ["App.Tests", "Demo.Tests", "Outer", "Inner"]],
+      ["Demo.Tests.Outer.Second", ["App.Tests", "Demo.Tests", "Outer"]],
+      ["Other.Tests.Late.Third", ["App.Tests", "Other.Tests", "Late"]],
     ],
   );
 });
@@ -347,4 +430,60 @@ test("findCoverageAttachment extracts the exact VSTest Cobertura attachment", ()
     findCoverageAttachment("Attachments:\n  /repo/TestResults/42/coverage.cobertura.xml\n"),
     "/repo/TestResults/42/coverage.cobertura.xml",
   );
+});
+
+test("parseDotnetProgressLine reads Microsoft.Testing.Platform and VSTest per-test lines", () => {
+  assert.deepEqual(parseDotnetProgressLine("passed SocketDirectoryUsesCurrentUserProfile (18ms)"), {
+    status: "passed",
+    displayName: "SocketDirectoryUsesCurrentUserProfile",
+    durationMs: 18,
+  });
+  assert.deepEqual(parseDotnetProgressLine("failed OversizedHeader (1s 234ms)"), {
+    status: "failed",
+    displayName: "OversizedHeader",
+    durationMs: 1234,
+  });
+  assert.deepEqual(parseDotnetProgressLine("  Passed Demo.Tests.Adds [12 ms]"), {
+    status: "passed",
+    displayName: "Demo.Tests.Adds",
+    durationMs: 12,
+  });
+  assert.deepEqual(parseDotnetProgressLine("  Skipped Demo.Tests.Later"), {
+    status: "skipped",
+    displayName: "Demo.Tests.Later",
+  });
+  assert.equal(parseDotnetProgressLine("Test Parallelization enabled for x"), undefined);
+  assert.equal(parseDotnetProgressLine("  failed: 1"), undefined);
+  assert.equal(parseDotnetProgressLine("Test run summary: Passed!"), undefined);
+});
+
+test("native MTP runs ask for one line per finished test and reuse the build", () => {
+  const detected = project(
+    `<Project Sdk="MSTest.Sdk/4.0.2" />`,
+    `{"test":{"runner":"Microsoft.Testing.Platform"}}`,
+  );
+  const spec = buildDotnetCommand(detected, {
+    action: "run",
+    workspaceRoot: "/repo",
+    reportDir: "/tmp/reports",
+    noBuild: true,
+    tests: [selected("Demo.Tests.Adds", detected)],
+  });
+  assert.deepEqual(spec.args.slice(0, 4), [
+    "test",
+    "--project",
+    "/repo/tests/App.Tests.csproj",
+    "--no-build",
+  ]);
+  for (const flag of ["--output", "detailed", "--no-progress", "--no-ansi", "--report-trx"]) {
+    assert.ok(!spec.args.includes("--progress"), "older platforms reject --progress off");
+    assert.ok(spec.args.includes(flag), flag);
+  }
+  assert.deepEqual(spec.args.slice(-2), ["--filter", "FullyQualifiedName=Demo.Tests.Adds"]);
+  assert.deepEqual(buildDotnetBuildCommand("/repo/App.slnx", { noRestore: true }).args, [
+    "build",
+    "/repo/App.slnx",
+    "--no-restore",
+  ]);
+  assert.equal(buildDotnetBuildCommand("/repo/App.slnx").cwd, "/repo");
 });

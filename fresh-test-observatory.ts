@@ -13,6 +13,7 @@ import type {
   TestSummary,
 } from "./lib/contracts.ts";
 import { TestObservatoryController, type ObservatorySnapshot } from "./lib/controller.ts";
+import { buildGitignoreMatcher, parseGitignore, type GitignoreMatcher } from "./lib/ignore.ts";
 import { parseJunit } from "./lib/junit.ts";
 import {
   buildTestTree,
@@ -40,9 +41,14 @@ import {
   captureTerminalProcessOutput,
   dockStructureFingerprint,
   endDirtySourceSession,
+  formatActivity,
+  displayableProgressLine,
+  formatElapsed,
+  LineSplitter,
   mutateDockContent,
   registerSourceLifecycleEvents,
   sourceSaveAction,
+  tickRenderPlan,
   updateDock,
 } from "./lib/runtime.ts";
 import {
@@ -99,6 +105,22 @@ interface TerminalWaiter {
   resolve(output: ProcessOutput): void;
 }
 
+interface StreamingProcess {
+  processId?: number;
+  /** Stop arrived before the host named the process; kill it on first output. */
+  killPending?: boolean;
+  /** Settles the await early: killing a background process never resolves its promise. */
+  cancel?: () => void;
+  stdout: string[];
+  stderr: string[];
+  stdoutLines: LineSplitter;
+  stderrLines: LineSplitter;
+  onLine(line: string, stream: "stdout" | "stderr"): void;
+}
+
+/** Render cadence while an operation runs; keeps the elapsed seconds moving evenly. */
+const TICK_MS = 250;
+
 const editor = getEditor();
 const PANEL_ID = 80_821;
 const PANEL_BUFFER_NAME = "*Test Observatory*";
@@ -121,6 +143,13 @@ const IGNORED_DIRECTORIES = new Set([
   "obj",
   "TestResults",
   ".fresh-test-observatory",
+  "artifacts",
+  ".artifacts",
+  ".vs",
+  ".idea",
+  ".cache",
+  "dist",
+  "out",
 ]);
 
 let settings: Settings = defineSettings();
@@ -144,14 +173,38 @@ let watchSessionOverride = false;
 let lastRunScope: TestScope | undefined;
 let lastOperationWasCoverage = false;
 let manualOutput = "";
-let activeProcess: ProcessHandle<SpawnResult> | undefined;
+let activeStream: StreamingProcess | undefined;
+const activeStreams = new Set<StreamingProcess>();
+const streamsByProcessId = new Map<number, StreamingProcess>();
+/** Spawn order; the host allocates process ids in the same order. */
+const pendingStreams: StreamingProcess[] = [];
 let activeTerminalId: number | undefined;
+let tickerId: number | undefined;
+let lastOutputLine = "";
+let lastTreeRenderAt = 0;
+/** Keyboard focus belongs to the tree unless the user moved it to a control. */
+let treeHasFocus = true;
+/** The host reports a click as a select; two on one row this close together open the test. */
+const DOUBLE_CLICK_MS = 400;
+let lastTreeSelect: { key: string; at: number } | undefined;
+let lastTreeKeyboardMoveAt = 0;
+/** Wall-clock time of the last discovery and the last run, shown when they finish. */
+let lastDiscoveryMs: number | undefined;
+let lastRunMs: number | undefined;
+const DETAIL_LINE_LIMIT = 12;
 let terminalRunActive = false;
 let lastDockStructure = "";
 let lastStatusBarText = "";
 const statusBarBuffers = new Set<number>();
 let lastSourceLocation: { path?: string; line?: number } = {};
 const discoveryCache = new Map<string, string[]>();
+
+function clearDiscoveryCaches(): void {
+  discoveryCache.clear();
+  workspaceListing = undefined;
+}
+let ignoreMatcher: { root: string; matcher: GitignoreMatcher } | undefined;
+let workspaceListing: { root: string; files: string[] } | undefined;
 const openBufferText = new Map<string, string>();
 const terminalWaiters = new Map<number, TerminalWaiter>();
 const invalidatedCoverageBuffers = new Set<number>();
@@ -310,17 +363,25 @@ function refreshSettings(): void {
 
 async function refreshTests(): Promise<number> {
   await prepareOpenBufferText();
-  discoveryCache.clear();
+  clearDiscoveryCaches();
+  ignoreMatcher = undefined;
   dirtySourcePaths.clear();
   invalidatedCoverageBuffers.clear();
   cleanDefaultReportDirectory();
+  const startedAt = Date.now();
   const count = await controller.refresh();
+  lastDiscoveryMs = Date.now() - startedAt;
   const snapshot = controller.snapshot();
   if (selectedTestId && !snapshot.tests.some((test) => test.id === selectedTestId)) {
     selectedTestId = undefined;
     selectedTreeKey = undefined;
   }
-  editor.setStatus(editor.t("status.discovered", { count: String(count) }));
+  editor.setStatus(
+    editor.t("status.discovered", {
+      count: String(count),
+      elapsed: formatElapsed(lastDiscoveryMs),
+    }),
+  );
   persistUiState();
   await paintDecorations();
   return count;
@@ -335,7 +396,9 @@ async function runScope(scope: TestScope): Promise<TestSummary> {
     selectedTestId = undefined;
     selectedTreeKey = undefined;
   }
+  const runStartedAt = Date.now();
   const summary = await controller.run(scope, selectionContext());
+  lastRunMs = Date.now() - runStartedAt;
   const focused = controller.snapshot().focusedTestId;
   if (focused) {
     selectedTestId = focused;
@@ -404,17 +467,18 @@ function createContext(): AdapterContext {
     cwd: editor.getCwd(),
     trusted: editor.workspaceTrustLevel() === "trusted",
     reportDir: reportDirectory(),
+    cacheDir: cacheDirectory(),
     preferNextest: settings.preferNextest,
     noBuild: settings.noBuild,
     noRestore: settings.noRestore,
     dotnetVerbosity: settings.dotnetVerbosity,
-    readFile(path): string | null {
-      const cached = openBufferText.get(pathKey(path));
-      if (cached !== undefined) return cached;
-      const content = editor.readFile(editor.authorityPath(path));
-      return typeof content === "string" ? content : null;
+    readFile: readWorkspaceFile,
+    writeFile(path, content): boolean {
+      editor.createDir(editor.authorityPath(dirname(path)));
+      return editor.writeFile(editor.authorityPath(path), content);
     },
     findFiles,
+    yieldToEditor: () => editor.delay(0),
     execute: executeProcess,
     ...(active.path ? { activeFile: active.path } : {}),
     ...(active.line !== undefined ? { activeLine: active.line } : {}),
@@ -426,10 +490,24 @@ async function findFiles(glob: string): Promise<string[]> {
   const cacheKey = pathKey(root) + "\0" + glob;
   const cached = discoveryCache.get(cacheKey);
   if (cached) return [...cached];
+  const matcher = globMatcher(glob);
+  const candidates = (await workspaceFiles(root)).filter((path) =>
+    matcher(relativePath(root, path)),
+  );
+  // Only files that declare tests, projects, or manifests are worth handing
+  // to an adapter; the signature check replaces a host content search.
   const pattern = sourceSearchPattern(glob);
-  const files = pattern
-    ? await filesContainingTestSignatures(root, glob, pattern)
-    : boundedFiles(root, glob);
+  const signature = pattern ? new RegExp(pattern, "im") : undefined;
+  const files: string[] = [];
+  let checked = 0;
+  for (const path of candidates) {
+    if (signature) {
+      const source = readWorkspaceFile(path);
+      if (source === null || !signature.test(source)) continue;
+      if (++checked % 32 === 0) await editor.delay(0);
+    }
+    files.push(path);
+  }
   const unique = [...new Map(files.map((path) => [pathKey(path), path])).values()].sort(
     (left, right) => pathKey(left).localeCompare(pathKey(right)),
   );
@@ -437,56 +515,28 @@ async function findFiles(glob: string): Promise<string[]> {
   return [...unique];
 }
 
-async function filesContainingTestSignatures(
-  root: string,
-  glob: string,
-  pattern: string,
-): Promise<string[]> {
-  const handle = editor.beginSearch(pattern, {
-    fixedString: false,
-    caseSensitive: false,
-    wholeWords: false,
-    maxResults: 100_000,
-    fileGlob: glob,
-  });
-  const files = new Map<string, string>();
-  for (;;) {
-    const batch = handle.take();
-    for (const match of batch.matches) {
-      const path = resolvePath(root, normalizePath(match.file));
-      files.set(pathKey(path), path);
-    }
-    if (batch.done) {
-      if (batch.error) throw new Error(batch.error);
-      if (batch.truncated) {
-        throw new Error(editor.t("error.discovery_truncated", { glob }));
-      }
-      break;
-    }
-    await editor.delay(5);
-  }
-
-  // Fresh's indexed search may interpret a leading **/ as requiring a
-  // directory separator. Check direct children as well so root-level test
-  // files are not omitted from otherwise targeted discovery.
-  const matcher = globMatcher(glob);
-  const signature = new RegExp(pattern, "im");
-  for (const entry of editor.readDir(editor.authorityPath(root))) {
-    if (!entry.is_file || !matcher(entry.name)) continue;
-    const path = joinPath(root, entry.name);
-    const source = editor.readFile(editor.authorityPath(path));
-    if (typeof source === "string" && signature.test(source)) {
-      files.set(pathKey(path), path);
-    }
-  }
-  return [...files.values()];
+/** File contents as the editor sees them: unsaved buffer text first, then disk. */
+function readWorkspaceFile(path: string): string | null {
+  const cached = openBufferText.get(pathKey(path));
+  if (cached !== undefined) return cached;
+  const content = editor.readFile(editor.authorityPath(path));
+  return typeof content === "string" ? content : null;
 }
 
-function boundedFiles(root: string, glob: string): string[] {
-  const matches: string[] = [];
-  const matcher = globMatcher(glob);
+/**
+ * Every file under the workspace root, walked once per discovery. Fresh's
+ * plugin-facing search walks ignored trees too and is run once per glob;
+ * this prunes `.gitignore` matches and known output directories on the way
+ * down, so a .NET ArtifactsPath or a vendored grammar is never entered.
+ */
+async function workspaceFiles(root: string): Promise<string[]> {
+  if (workspaceListing && pathKey(workspaceListing.root) === pathKey(root)) {
+    return workspaceListing.files;
+  }
+  const ignore = gitignoreFor(root);
+  const files: string[] = [];
   const queue: Array<{ path: string; depth: number }> = [{ path: root, depth: 0 }];
-  let visited = 0;
+  let directories = 0;
   while (queue.length > 0) {
     const current = queue.shift()!;
     if (current.depth > 16) continue;
@@ -496,22 +546,42 @@ function boundedFiles(root: string, glob: string): string[] {
     } catch {
       continue;
     }
+    if (
+      current.depth > 0 &&
+      entries.some((entry) => entry.is_file && entry.name === ".gitignore")
+    ) {
+      const text = editor.readFile(editor.authorityPath(joinPath(current.path, ".gitignore")));
+      if (typeof text === "string") ignore.addRules(parseGitignore(current.path, text));
+    }
     for (const entry of entries) {
       if (entry.is_dir && IGNORED_DIRECTORIES.has(entry.name)) continue;
       const path = joinPath(current.path, entry.name);
+      if (ignore.isIgnored(path, entry.is_dir)) continue;
       if (entry.is_dir) {
         queue.push({ path, depth: current.depth + 1 });
       } else if (entry.is_file) {
-        visited += 1;
-        const relative = relativePath(root, path);
-        if (matcher(relative)) matches.push(path);
-        if (visited > 100_000) {
-          throw new Error(editor.t("error.file_walk_limit", { glob }));
+        files.push(path);
+        if (files.length > 100_000) {
+          throw new Error(editor.t("error.file_walk_limit", { glob: "**" }));
         }
       }
     }
+    // Keep the dock rendering while a large tree is walked.
+    if (++directories % 64 === 0) await editor.delay(0);
   }
-  return matches;
+  workspaceListing = { root, files };
+  return files;
+}
+
+/** Reads the root .gitignore once per discovery; nested files join during the walk. */
+function gitignoreFor(root: string): GitignoreMatcher {
+  if (ignoreMatcher && pathKey(ignoreMatcher.root) === pathKey(root)) return ignoreMatcher.matcher;
+  const matcher = buildGitignoreMatcher(root, [], (path) => {
+    const content = editor.readFile(editor.authorityPath(path));
+    return typeof content === "string" ? content : null;
+  });
+  ignoreMatcher = { root, matcher };
+  return matcher;
 }
 
 function sourceSearchPattern(glob: string): string | undefined {
@@ -530,6 +600,14 @@ function sourceSearchPattern(glob: string): string | undefined {
   if (glob.endsWith(".vb")) {
     return "<\\s*(?:[A-Za-z0-9_.]+\\.)?(?:TestMethod|DataTestMethod|Fact|Theory|Test|TestCase)\\b";
   }
+  // Manifests and solutions go through the host search as well, so ignored
+  // output trees (a .NET ArtifactsPath, for example) never contribute stale
+  // copies of a project.
+  if (glob.endsWith("*.*proj")) return "<Project\\b";
+  if (glob.endsWith("*.slnx")) return "<Solution\\b";
+  if (glob.endsWith("*.sln")) return "^Microsoft Visual Studio Solution File";
+  if (glob.endsWith("Cargo.toml")) return "^\\s*\\[(?:package|workspace)\\]";
+  if (glob.endsWith("go.mod")) return "^\\s*module\\s";
   return undefined;
 }
 
@@ -577,20 +655,135 @@ async function executeProcess(spec: ProcessSpec): Promise<ProcessOutput> {
   if (spec.reportPath) editor.createDir(editor.authorityPath(dirname(spec.reportPath)));
   editor.setStatus(spec.label ?? editor.t("status.running_command", { command: spec.command }));
   if (terminalRunActive || settings.terminalRuns) return executeInTerminal(spec);
-  const handle = editor.spawnProcess(spec.command, spec.args, spec.cwd ?? editor.getCwd());
-  activeProcess = handle;
-  try {
-    const result = await handle.result;
-    return {
-      stdout: result.stdout,
-      stderr: result.stderr,
-      exitCode: result.exit_code,
-    };
-  } catch (error) {
-    return { stdout: "", stderr: errorMessage(error), exitCode: -1 };
-  } finally {
-    if (activeProcess === handle) activeProcess = undefined;
+  // Everything runs as a background process: a plain spawn's handle cannot
+  // kill the OS process, so Stop would leave it running and hang the await.
+  return executeStreaming(spec, spec.onLine ?? (() => {}));
+}
+
+/**
+ * Runs a command as a Fresh background process so its output arrives line by
+ * line while it executes. The host names the process id on the first output
+ * event, which is also what Stop uses to kill it.
+ */
+async function executeStreaming(
+  spec: ProcessSpec,
+  onLine: (line: string, stream: "stdout" | "stderr") => void,
+): Promise<ProcessOutput> {
+  const stream: StreamingProcess = {
+    stdout: [],
+    stderr: [],
+    stdoutLines: new LineSplitter(),
+    stderrLines: new LineSplitter(),
+    onLine: (line, kind) => {
+      const shown = displayableProgressLine(line);
+      if (shown) lastOutputLine = shown;
+      (kind === "stdout" ? stream.stdout : stream.stderr).push(line);
+      try {
+        onLine(line, kind);
+      } catch (error) {
+        editor.debug("Test Observatory: progress line handler failed: " + errorMessage(error));
+      }
+    },
+  };
+  activeStream = stream;
+  activeStreams.add(stream);
+  const cancelled = new Promise<{ cancelled: true }>((resolve) => {
+    stream.cancel = () => resolve({ cancelled: true });
+  });
+  const spawned = spawnTracked(spec.command, spec.args, spec.cwd ?? editor.getCwd());
+  if (spawned.processId !== undefined) {
+    stream.processId = spawned.processId;
+    streamsByProcessId.set(spawned.processId, stream);
+  } else {
+    pendingStreams.push(stream);
   }
+  try {
+    // The host's kill aborts the process without ever settling this promise,
+    // so a Stop resolves the race instead of waiting for an exit event.
+    const settled = await Promise.race([
+      spawned.result
+        .then((result) => ({ exitCode: result.exit_code ?? -1 }))
+        .catch((error: unknown) => ({ error: errorMessage(error) })),
+      cancelled,
+    ]);
+    for (const line of stream.stdoutLines.flush()) stream.onLine(line, "stdout");
+    for (const line of stream.stderrLines.flush()) stream.onLine(line, "stderr");
+    if ("cancelled" in settled) {
+      return { stdout: stream.stdout.join("\n"), stderr: stream.stderr.join("\n"), exitCode: 130 };
+    }
+    if ("error" in settled) {
+      return { stdout: stream.stdout.join("\n"), stderr: settled.error, exitCode: -1 };
+    }
+    return {
+      stdout: stream.stdout.join("\n"),
+      stderr: stream.stderr.join("\n"),
+      exitCode: settled.exitCode,
+    };
+  } finally {
+    activeStreams.delete(stream);
+    if (stream.processId !== undefined) {
+      streamsByProcessId.delete(stream.processId);
+    }
+    if (stream.processId !== undefined || !stream.killPending) {
+      // A kill-pending stream with no id yet stays queued so the first
+      // output can still name and kill the orphaned process.
+      const pending = pendingStreams.indexOf(stream);
+      if (pending >= 0) pendingStreams.splice(pending, 1);
+    }
+    if (activeStream === stream) activeStream = undefined;
+  }
+}
+
+/**
+ * Spawns through the host's raw entry point when available: the returned
+ * request id is the process id, known before any output arrives, so Stop can
+ * always kill the real process. Falls back to the public wrapper (process id
+ * then arrives with the first output) if the internals ever change.
+ */
+function spawnTracked(
+  command: string,
+  args: string[],
+  cwd: string,
+): { processId?: number; result: Promise<{ exit_code?: number }> } {
+  const raw = (
+    editor as unknown as {
+      _spawnBackgroundProcessStart?: (command: string, args: string[], cwd: string) => number;
+    }
+  )._spawnBackgroundProcessStart;
+  const callbacks = (
+    globalThis as unknown as {
+      _pendingCallbacks?: Map<
+        number,
+        { resolve(value: unknown): void; reject(error: unknown): void }
+      >;
+    }
+  )._pendingCallbacks;
+  if (typeof raw === "function" && callbacks) {
+    const processId = (
+      editor as unknown as Record<string, (command: string, args: string[], cwd: string) => number>
+    )["_spawnBackgroundProcessStart"]!(command, args, cwd);
+    const result = new Promise((resolve, reject) => callbacks.set(processId, { resolve, reject }));
+    return { processId, result: result as Promise<{ exit_code?: number }> };
+  }
+  return { result: editor.spawnBackgroundProcess(command, args, cwd).result };
+}
+
+function receiveProcessOutput(processId: number, data: string, kind: "stdout" | "stderr"): void {
+  let stream = streamsByProcessId.get(processId);
+  if (!stream) {
+    // First output from a process the host has not named to us yet; spawn
+    // order and id order agree, so the oldest unnamed stream owns it.
+    stream = pendingStreams.shift();
+    if (!stream) return;
+    stream.processId = processId;
+    if (stream.killPending) {
+      editor.killProcess(processId);
+      return;
+    }
+    streamsByProcessId.set(processId, stream);
+  }
+  const splitter = kind === "stdout" ? stream.stdoutLines : stream.stderrLines;
+  for (const line of splitter.push(data)) stream.onLine(line, kind);
 }
 
 async function executeInTerminal(spec: ProcessSpec): Promise<ProcessOutput> {
@@ -614,9 +807,17 @@ async function executeInTerminal(spec: ProcessSpec): Promise<ProcessOutput> {
 }
 
 async function cancelActiveProcess(): Promise<boolean> {
-  if (activeProcess) return activeProcess.kill();
-  if (activeTerminalId !== undefined) return editor.closeTerminal(activeTerminalId);
-  return false;
+  // Listings run in parallel, so several processes can be live at once. A
+  // process that has not produced output yet has no id; it dies on its first.
+  let any = false;
+  for (const stream of [...activeStreams]) {
+    any = true;
+    if (stream.processId !== undefined) editor.killProcess(stream.processId);
+    else stream.killPending = true;
+    stream.cancel?.();
+  }
+  if (!any && activeTerminalId !== undefined) return editor.closeTerminal(activeTerminalId);
+  return any;
 }
 
 function reportDirectory(): string {
@@ -627,6 +828,16 @@ function reportDirectory(): string {
       : joinPath(editor.getTempDir(), configured);
   }
   return joinPath(editor.getTempDir(), "fresh-test-observatory", workspaceHash(editor.getCwd()));
+}
+
+/** Listings and other reusable state; never cleaned with the report directory. */
+function cacheDirectory(): string {
+  return joinPath(
+    editor.getTempDir(),
+    "fresh-test-observatory",
+    "cache",
+    workspaceHash(editor.getCwd()),
+  );
 }
 
 function cleanDefaultReportDirectory(): void {
@@ -677,7 +888,45 @@ function activeLocation(): { path?: string; line?: number } {
 
 function onControllerChanged(): void {
   const snapshot = controller.snapshot();
+  if (snapshot.busy && tickerId === undefined) {
+    lastOutputLine = "";
+    lastTickAt = 0;
+    tickerId = editor.setInterval(TICK_MS, "test_observatory_tick");
+  } else if (!snapshot.busy && tickerId !== undefined) {
+    editor.clearInterval(tickerId);
+    tickerId = undefined;
+    lastOutputLine = "";
+  }
   updateDock(() => mutateDock(snapshot), renderDock);
+  updateStatusBar();
+}
+
+/**
+ * Streamed results only change controller state; this timer draws them. The
+ * title, detail lines, and status token are small mutations sent every tick,
+ * so the elapsed seconds advance evenly. The full tree is resent at most once
+ * a second: Fresh drains plugin commands under a per-frame budget, and a
+ * large tree on every tick would delay the small updates behind it.
+ */
+let lastTickAt = 0;
+
+function tick(): void {
+  const snapshot = controller.snapshot();
+  if (!snapshot.busy) return;
+  const now = Date.now();
+  if (lastTickAt > 0 && now - lastTickAt > TICK_MS * 3) {
+    editor.debug(
+      `Test Observatory: render tick stalled ${now - lastTickAt} ms during "${snapshot.progress}"`,
+    );
+  }
+  lastTickAt = now;
+  const structureChanged =
+    dockOpen && panelMounted && currentDockStructure(snapshot) !== lastDockStructure;
+  if (tickRenderPlan(Date.now(), lastTreeRenderAt, structureChanged) === "tree") {
+    renderDock();
+  } else {
+    mutateDock(snapshot, true);
+  }
   updateStatusBar();
 }
 
@@ -685,20 +934,24 @@ async function openDock(): Promise<void> {
   activeLocation();
   dockOpen = true;
   persistUiState();
-  if (dockBufferId !== undefined) {
+  if (dockBufferId !== undefined && dockIsDisplayed()) {
     renderDock();
     if (dockSplitId !== undefined) editor.focusSplit(dockSplitId);
     return;
   }
+  // Either the buffer is gone, or another utility panel took over the dock
+  // and was closed with it. Discard what is left and build the dock again.
+  if (panelMounted) editor.unmountWidgetPanel(PANEL_ID);
+  panelMounted = false;
+  dockBufferId = undefined;
+  dockSplitId = undefined;
   const stale = editor
     .listBuffers()
-    .find(
+    .filter(
       (buffer) => buffer.is_virtual && !buffer.is_terminal && buffer.name === PANEL_BUFFER_NAME,
     );
-  if (stale) {
-    editor.closeBuffer(stale.id, true);
-    await editor.flush();
-  }
+  for (const buffer of stale) editor.closeBuffer(buffer.id, true);
+  if (stale.length > 0) await editor.flush();
   try {
     const result = await editor.createVirtualBufferInSplit({
       name: PANEL_BUFFER_NAME,
@@ -715,9 +968,12 @@ async function openDock(): Promise<void> {
     });
     dockBufferId = result.bufferId;
     dockSplitId = result.splitId ?? editor.getActiveSplitId();
+    // An existing utility dock keeps its own size, so apply the setting here
+    // rather than relying on the ratio passed at creation.
+    editor.setSplitRatio(dockSplitId, 1 - settings.dockWidth / 100);
     panelMounted = editor.mountWidgetPanel(PANEL_ID, result.bufferId, dockSpec());
+    treeHasFocus = true;
     renderDock();
-    editor.widgetMutate(PANEL_ID, { kind: "setFocusKey", widgetKey: TREE_KEY });
     if (controller.snapshot().tests.length === 0 && !controller.snapshot().busy) {
       await refreshTests();
     }
@@ -729,6 +985,12 @@ async function openDock(): Promise<void> {
     persistUiState();
     throw error;
   }
+}
+
+/** True while the dock buffer still exists and some split shows it. */
+function dockIsDisplayed(): boolean {
+  const buffer = editor.listBuffers().find((entry) => entry.id === dockBufferId);
+  return Boolean(buffer && buffer.splits.length > 0);
 }
 
 function openDockIfNeeded(): void {
@@ -752,14 +1014,32 @@ function renderDock(): void {
   const snapshot = controller.snapshot();
   editor.updateWidgetPanel(PANEL_ID, showOutput ? outputSpec() : dockSpec());
   lastDockStructure = currentDockStructure(snapshot);
+  lastTreeRenderAt = Date.now();
+  if (showOutput) return;
+  // The host keeps tree selection by row index and focus by widget; rows move
+  // when results add parameterized cases, and a full update can land focus on
+  // the first button. Put both back where the user left them.
+  const index = treeRows.findIndex(
+    (item) => item.key === selectedTreeKey || (selectedTestId && item.testId === selectedTestId),
+  );
+  if (index >= 0) {
+    editor.widgetMutate(PANEL_ID, { kind: "setSelectedIndex", widgetKey: TREE_KEY, index });
+  }
+  if (treeHasFocus && treeRows.length > 0) {
+    editor.widgetMutate(PANEL_ID, { kind: "setFocusKey", widgetKey: TREE_KEY });
+  }
 }
 
-function mutateDock(snapshot: ObservatorySnapshot): boolean {
+/**
+ * Updates title, details, and output in place. With `contentOnly` the tree may
+ * be stale (a tick between rebuilds); the mutated widgets exist either way.
+ */
+function mutateDock(snapshot: ObservatorySnapshot, contentOnly = false): boolean {
   if (
     !dockOpen ||
     dockBufferId === undefined ||
     !panelMounted ||
-    currentDockStructure(snapshot) !== lastDockStructure
+    (!contentOnly && currentDockStructure(snapshot) !== lastDockStructure)
   ) {
     return false;
   }
@@ -903,14 +1183,8 @@ function outputEntries(): TextPropertyEntry[] {
 
 function dockTitle(snapshot: ObservatorySnapshot): string {
   const summary = controller.currentSummary();
-  return snapshot.busy
-    ? "◉ " +
-        snapshot.progress +
-        " · " +
-        editor.t(summary.total === 1 ? "panel.one_test" : "panel.many_tests", {
-          count: String(summary.total),
-        })
-    : titleSummary(snapshot, summary, summarizeTests(snapshot.tests));
+  if (!snapshot.busy) return titleSummary(snapshot, summary, summarizeTests(snapshot.tests));
+  return "◉ " + formatActivity(snapshot.progress, snapshot.activity, Date.now());
 }
 
 function filteredTests(snapshot: ObservatorySnapshot): TestCase[] {
@@ -963,17 +1237,55 @@ function detailEntries(snapshot: ObservatorySnapshot): TextPropertyEntry[] {
       if (selected.message) entries.push({ text: selected.message });
       if (selected.stack) {
         entries.push({ text: editor.t("panel.stack"), style: { bold: true } });
-        entries.push(...selected.stack.split(/\r?\n/).map((text) => ({ text })));
+        const lines = selected.stack.split(/\r?\n/);
+        const shown = lines.slice(0, DETAIL_LINE_LIMIT);
+        entries.push(...shown.map((text) => ({ text })));
+        if (lines.length > shown.length) {
+          entries.push({
+            text: editor.t("panel.more_in_output", { count: String(lines.length - shown.length) }),
+            style: { fg: "diagnostic.info_fg" },
+          });
+        }
       }
     } else if (snapshot.busy) {
       entries.push({ text: snapshot.progress || editor.t("panel.running") });
+      if (snapshot.activity) {
+        const live = snapshot.activity;
+        entries.push({
+          text:
+            live.total > 0
+              ? editor.t("panel.progress_counts", {
+                  completed: String(live.completed),
+                  total: String(live.total),
+                  elapsed: formatElapsed(Date.now() - live.startedAt),
+                })
+              : editor.t("panel.progress_elapsed", {
+                  elapsed: formatElapsed(Date.now() - live.startedAt),
+                }),
+        });
+      }
+      if (lastOutputLine) {
+        entries.push({ text: lastOutputLine, style: { fg: "diagnostic.info_fg" } });
+      }
     } else if (lastRunScope && snapshot.summaryTestIds) {
       entries.push(
-        ...formatRunSummary(controller.currentSummary(), translate).map((text) => ({ text })),
+        ...formatRunSummary(
+          controller.currentSummary(),
+          translate,
+          lastRunMs === undefined ? undefined : formatElapsed(lastRunMs),
+        ).map((text) => ({ text })),
       );
     } else if (editor.workspaceTrustLevel() !== "trusted") {
       entries.push({ text: editor.t("panel.trust_required") });
     } else {
+      if (lastDiscoveryMs !== undefined && snapshot.tests.length > 0) {
+        entries.push({
+          text: editor.t("panel.loaded", {
+            count: String(snapshot.tests.length),
+            elapsed: formatElapsed(lastDiscoveryMs),
+          }),
+        });
+      }
       entries.push({ text: editor.t("panel.select_test") });
     }
   }
@@ -1021,6 +1333,7 @@ function setAllTreeBranchesExpanded(expanded: boolean): void {
   treeExpansionMode = expanded ? "all" : "none";
   const keys = resolveExpandedTreeKeys(treeRows, treeExpansionMode);
   expandedTreeKeys = new Set(keys);
+  treeHasFocus = true;
   if (panelMounted) {
     for (const mutation of treeExpansionAction(TREE_KEY, keys)) {
       editor.widgetMutate(PANEL_ID, mutation);
@@ -1383,7 +1696,7 @@ function invalidateDecorations(bufferId: number): void {
   ) {
     return;
   }
-  discoveryCache.clear();
+  clearDiscoveryCaches();
   editor.clearLineIndicators(bufferId, TEST_NAMESPACE);
   editor.removeVirtualTextsByPrefix(bufferId, FAILURE_TEXT_PREFIX);
   paintTestExplorerDecorations(testStateByPath());
@@ -1421,8 +1734,28 @@ function updateStatusBar(): void {
   const coverage = coverageVisible
     ? " Cov " + summarizeCoverage(snapshot.coverage).percent + "%"
     : "";
-  const text =
-    prefix + " ✓" + summary.passed + " ✕" + summary.failed + " ○" + summary.skipped + coverage;
+  const text = snapshot.busy
+    ? "◉ " +
+      formatActivity(
+        snapshot.activity && snapshot.activity.total > 0
+          ? editor.t("status.running_prefix")
+          : snapshot.progress,
+        snapshot.activity,
+        Date.now(),
+      )
+    : prefix + " ✓" + summary.passed + " ✕" + summary.failed + " ○" + summary.skipped + coverage;
+  if (snapshot.busy) {
+    // One small command per tick; every other buffer catches up when the run ends.
+    if (text === lastStatusBarText) return;
+    lastStatusBarText = text;
+    statusBarBuffers.clear();
+    const active = editor.getActiveBufferId();
+    if (active) {
+      editor.setStatusBarValue(active, STATUS_TOKEN, text);
+      statusBarBuffers.add(active);
+    }
+    return;
+  }
   const buffers = editor.listBuffers();
   if (text === lastStatusBarText) {
     for (const buffer of buffers) {
@@ -1444,7 +1777,7 @@ async function runSavedFile(path: string): Promise<void> {
   if (controller.snapshot().busy) return;
   await prepareOpenBufferText();
   endDirtySourceSession(dirtySourcePaths, pathKey(path));
-  discoveryCache.clear();
+  clearDiscoveryCaches();
   if (!controller.snapshot().discoveryRoot) await controller.refresh();
   const active = { activeFile: path, activeLine: 1 };
   lastRunScope = "file";
@@ -1524,10 +1857,11 @@ function formatDuration(milliseconds: number): string {
 }
 
 function formatStatusSummary(summary: TestSummary): string {
-  return editor.t("status.summary", {
+  return editor.t(lastRunMs === undefined ? "status.summary" : "status.summary_elapsed", {
     passed: String(summary.passed),
     failed: String(summary.failed),
     skipped: String(summary.skipped),
+    elapsed: lastRunMs === undefined ? "" : formatElapsed(lastRunMs),
   });
 }
 
@@ -1613,6 +1947,7 @@ registerHandler(
 );
 registerHandler("test_observatory_toggle_coverage", guarded(toggleCoverage));
 registerHandler("test_observatory_stop", guarded(stopRun));
+registerHandler("test_observatory_tick", tick);
 registerHandler("test_observatory_open_selected", openSelectedTest);
 registerHandler("test_observatory_expand_all", () => setAllTreeBranchesExpanded(true));
 registerHandler("test_observatory_collapse_all", () => setAllTreeBranchesExpanded(false));
@@ -1632,27 +1967,33 @@ registerHandler("test_observatory_context_close", () =>
 registerHandler("test_observatory_context_c", () =>
   showOutput ? copyOutput() : void guardedCall(toggleCoverage),
 );
-registerHandler("test_observatory_widget_up", () =>
-  editor.widgetCommand(PANEL_ID, { kind: "key", key: "Up" }),
-);
-registerHandler("test_observatory_widget_down", () =>
-  editor.widgetCommand(PANEL_ID, { kind: "key", key: "Down" }),
-);
+registerHandler("test_observatory_widget_up", () => {
+  lastTreeKeyboardMoveAt = Date.now();
+  editor.widgetCommand(PANEL_ID, { kind: "key", key: "Up" });
+});
+registerHandler("test_observatory_widget_down", () => {
+  lastTreeKeyboardMoveAt = Date.now();
+  editor.widgetCommand(PANEL_ID, { kind: "key", key: "Down" });
+});
 registerHandler("test_observatory_widget_left", () =>
   editor.widgetCommand(PANEL_ID, { kind: "key", key: "Left" }),
 );
 registerHandler("test_observatory_widget_right", () =>
   editor.widgetCommand(PANEL_ID, { kind: "key", key: "Right" }),
 );
-registerHandler("test_observatory_widget_tab", () =>
-  editor.widgetCommand(PANEL_ID, { kind: "focusAdvance", delta: 1 }),
-);
-registerHandler("test_observatory_widget_backtab", () =>
-  editor.widgetCommand(PANEL_ID, { kind: "focusAdvance", delta: -1 }),
-);
-registerHandler("test_observatory_widget_activate", () =>
-  editor.widgetCommand(PANEL_ID, { kind: "activate" }),
-);
+registerHandler("test_observatory_widget_tab", () => {
+  treeHasFocus = false;
+  editor.widgetCommand(PANEL_ID, { kind: "focusAdvance", delta: 1 });
+});
+registerHandler("test_observatory_widget_backtab", () => {
+  treeHasFocus = false;
+  editor.widgetCommand(PANEL_ID, { kind: "focusAdvance", delta: -1 });
+});
+registerHandler("test_observatory_widget_activate", () => {
+  // The "activate" command only fires buttons and toggles; a tree's
+  // activate event comes from its Enter handling, so route the key.
+  editor.widgetCommand(PANEL_ID, { kind: "key", key: "Enter" });
+});
 
 editor.defineMode(
   PANEL_MODE,
@@ -1725,6 +2066,8 @@ editor.on("widget_event", (event) => {
     closeDock();
     return;
   }
+  if (event.widget_key === TREE_KEY) treeHasFocus = true;
+  else if (event.event_type === "activate" && event.widget_key !== OUTPUT_KEY) treeHasFocus = false;
   if (event.widget_key === TREE_KEY && event.event_type === "expand") {
     const key = event.payload.key;
     const expanded = event.payload.expanded;
@@ -1747,7 +2090,15 @@ editor.on("widget_event", (event) => {
     coverageDetailsVisible = false;
     lastOperationWasCoverage = false;
     persistUiState();
-    if (event.event_type === "activate" && selectedTestId) openSelectedTest();
+    const now = Date.now();
+    const doubleClick =
+      event.event_type === "select" &&
+      selectedTreeKey !== undefined &&
+      lastTreeSelect?.key === selectedTreeKey &&
+      now - lastTreeSelect.at <= DOUBLE_CLICK_MS &&
+      now - lastTreeKeyboardMoveAt > DOUBLE_CLICK_MS;
+    lastTreeSelect = selectedTreeKey ? { key: selectedTreeKey, at: now } : undefined;
+    if ((event.event_type === "activate" || doubleClick) && selectedTestId) openSelectedTest();
     else renderDock();
     return;
   }
@@ -1813,6 +2164,20 @@ editor.on("widget_event", (event) => {
   }
 });
 
+// Fresh delivers background-process output on legacy hook names; the typed
+// `process_output` alias is registered too for hosts that route through it.
+registerHandler("test_observatory_process_stdout", (event: { process_id: number; data: string }) =>
+  receiveProcessOutput(event.process_id, event.data, "stdout"),
+);
+registerHandler("test_observatory_process_stderr", (event: { process_id: number; data: string }) =>
+  receiveProcessOutput(event.process_id, event.data, "stderr"),
+);
+editor.on("process_output", (event) =>
+  receiveProcessOutput(event.process_id, event.data, "stdout"),
+);
+editor.on("onProcessStdout", "test_observatory_process_stdout");
+editor.on("onProcessStderr", "test_observatory_process_stderr");
+
 editor.on("terminal_output", (event) => {
   const waiter = terminalWaiters.get(event.terminal_id);
   if (!waiter) return;
@@ -1842,7 +2207,7 @@ async function finishTerminalRun(terminalId: number, exitCode: number | null): P
 }
 
 function sourceFileSaved(path: string, bufferId: number): void {
-  discoveryCache.clear();
+  clearDiscoveryCaches();
   openBufferText.delete(pathKey(path));
   const action = sourceSaveAction(
     dirtySourcePaths,
@@ -1858,7 +2223,7 @@ function sourceFileSaved(path: string, bufferId: number): void {
 }
 
 function sourceFileReverted(path: string, bufferId: number): void {
-  discoveryCache.clear();
+  clearDiscoveryCaches();
   openBufferText.delete(pathKey(path));
   endDirtySourceSession(dirtySourcePaths, pathKey(path));
   invalidatedCoverageBuffers.delete(bufferId);
@@ -1872,7 +2237,7 @@ registerSourceLifecycleEvents((eventName, handler) => editor.on(eventName, handl
 });
 
 editor.on("after_file_explorer_change", () => {
-  discoveryCache.clear();
+  clearDiscoveryCaches();
   if (dockOpen && !controller.snapshot().busy) void guardedCall(refreshTests);
 });
 
@@ -1894,7 +2259,7 @@ editor.on("buffer_closed", (event) => {
 });
 
 editor.on("trust_changed", (event) => {
-  discoveryCache.clear();
+  clearDiscoveryCaches();
   if (event.level === "trusted" && dockOpen && !controller.snapshot().busy) {
     void guardedCall(refreshTests);
   } else {
@@ -1904,7 +2269,7 @@ editor.on("trust_changed", (event) => {
 
 editor.on("config_changed", () => {
   refreshSettings();
-  discoveryCache.clear();
+  clearDiscoveryCaches();
   renderDock();
   if (dockOpen && !controller.snapshot().busy) void guardedCall(refreshTests);
 });
