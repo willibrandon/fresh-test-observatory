@@ -1,6 +1,6 @@
 Fresh Test Observatory is a test explorer for [Fresh](https://github.com/sinelaw/fresh). It discovers tests, runs them at workspace, file, selected, or cursor scope, keeps complete runner output available, navigates failures, and marks source coverage.
 
-Install it with Package: Install from URL using https://github.com/willibrandon/fresh-test-observatory, then run Test Observatory: Open from the command palette.
+Install it with `Package: Install from URL` using https://github.com/willibrandon/fresh-test-observatory, then run `Test Observatory: Open` from the command palette.
 
 Rust projects use cargo-nextest when it is installed and fall back to Cargo. Go projects use the standard toolchain. .NET projects can use VSTest or Microsoft.Testing.Platform with MSTest, xUnit, NUnit, bUnit, or TUnit. JUnit results and Cobertura coverage can also be imported.
 
