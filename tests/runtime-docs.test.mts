@@ -263,7 +263,9 @@ test("README names every public command, dock key, setting, and status token", (
     "dotnetVerbosity",
   ];
 
-  for (const command of commands) assert.ok(readme.includes(command), command);
+  for (const command of commands) {
+    assert.ok(readme.includes(`\`Test Observatory: ${command}\``), command);
+  }
   for (const key of keys) assert.ok(readme.includes(key), key);
   for (const setting of settings) assert.ok(readme.includes(`\`${setting}\``), setting);
   assert.match(readme, /fresh-test-observatory:test-summary/);
