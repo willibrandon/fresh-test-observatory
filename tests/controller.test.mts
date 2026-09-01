@@ -131,6 +131,28 @@ test("controller turns unreported process failures into failed rows and replaces
   assert.equal(controller.snapshot().tests[0]?.message, undefined);
 });
 
+test("controller trusts conclusive parsed results when terminal exit status is unavailable", async () => {
+  let parsedStatus: TestCase["status"] = "passed";
+  const fake = adapter({
+    run: (_context, request) => ({
+      tests: request.tests.map((item) => ({ ...item, status: parsedStatus })),
+      output: parsedStatus === "failed" ? "FAIL case" : "PASS case",
+      exitCode: -1,
+    }),
+  });
+  const controller = new TestObservatoryController(port("trusted"), [fake]);
+  await controller.refresh();
+
+  const passed = await controller.run("workspace");
+  assert.equal(passed.passed, 1);
+  assert.deepEqual(controller.snapshot().diagnostics, []);
+
+  parsedStatus = "failed";
+  const failed = await controller.run("workspace");
+  assert.equal(failed.failed, 1);
+  assert.deepEqual(controller.snapshot().diagnostics, []);
+});
+
 test("controller removes stale tests when an adapter is replaced or unregistered", async () => {
   const controller = new TestObservatoryController(port("trusted"), [adapter()]);
   await controller.refresh();

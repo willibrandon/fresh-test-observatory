@@ -89,13 +89,14 @@ public class CalculatorTests { [TestMethod] public void Adds() {} }`,
   };
   let listRuns = 0;
   const fake = context(files, (spec) => {
-    if (spec.args.includes("--list-tests")) listRuns += 1;
+    const listing = spec.args.includes("--list-tests");
+    if (listing) listRuns += 1;
     return {
-      stdout: spec.args.includes("--list-tests")
+      stdout: listing
         ? "The following Tests are available:\n    Demo.Tests.CalculatorTests.Adds\n"
         : "  Passed Demo.Tests.CalculatorTests.Adds [5 ms]\n",
       stderr: "",
-      exitCode: 0,
+      exitCode: listing ? 0 : -1,
     };
   });
   const adapter = createBuiltInAdapters().find((item) => item.id === "dotnet")!;
@@ -111,6 +112,7 @@ public class CalculatorTests { [TestMethod] public void Adds() {} }`,
   const result = await adapter.run(fake, { scope: "workspace", tests: discovered.tests });
   assert.equal(result.tests[0]!.status, "passed");
   assert.equal(result.tests[0]!.source!.path, "/repo/tests/CalculatorTests.cs");
+  assert.equal(result.exitCode, -1);
 });
 
 test(".NET adapter keeps duplicate method names in distinct classes", async () => {

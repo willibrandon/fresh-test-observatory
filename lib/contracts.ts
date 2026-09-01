@@ -67,6 +67,7 @@ export interface ProcessSpec {
 export interface ProcessOutput {
   stdout: string;
   stderr: string;
+  /** Process status, or -1 when the host cannot report one. */
   exitCode: number;
 }
 

@@ -37,9 +37,13 @@ import {
 } from "./lib/path.ts";
 import {
   beginDirtySourceSession,
+  captureTerminalProcessOutput,
   dockStructureFingerprint,
   endDirtySourceSession,
-  terminalProcessOutput,
+  mutateDockContent,
+  registerSourceLifecycleEvents,
+  sourceSaveAction,
+  updateDock,
 } from "./lib/runtime.ts";
 import {
   button,
@@ -673,7 +677,7 @@ function activeLocation(): { path?: string; line?: number } {
 
 function onControllerChanged(): void {
   const snapshot = controller.snapshot();
-  if (!mutateDock(snapshot)) renderDock();
+  updateDock(() => mutateDock(snapshot), renderDock);
   updateStatusBar();
 }
 
@@ -759,26 +763,15 @@ function mutateDock(snapshot: ObservatorySnapshot): boolean {
   ) {
     return false;
   }
-  if (showOutput) {
-    const entries = outputEntries();
-    return editor.widgetMutate(PANEL_ID, {
-      kind: "setItems",
-      widgetKey: OUTPUT_KEY,
-      items: entries,
-      itemKeys: entries.map((_, index) => `${OUTPUT_KEY}:${index}`),
-    });
-  }
-  const titleUpdated = editor.widgetMutate(PANEL_ID, {
-    kind: "setRawEntries",
-    widgetKey: "title",
-    entries: [{ text: dockTitle(snapshot), style: { bold: true } }],
+  return mutateDockContent((mutation) => editor.widgetMutate(PANEL_ID, mutation), {
+    showOutput,
+    outputWidgetKey: OUTPUT_KEY,
+    outputEntries: outputEntries(),
+    titleWidgetKey: "title",
+    titleEntries: [{ text: dockTitle(snapshot), style: { bold: true } }],
+    detailsWidgetKey: "details",
+    detailEntries: detailEntries(snapshot),
   });
-  const detailsUpdated = editor.widgetMutate(PANEL_ID, {
-    kind: "setRawEntries",
-    widgetKey: "details",
-    entries: detailEntries(snapshot),
-  });
-  return titleUpdated && detailsUpdated;
 }
 
 function currentDockStructure(snapshot: ObservatorySnapshot): string {
@@ -1838,34 +1831,44 @@ async function finishTerminalRun(terminalId: number, exitCode: number | null): P
   if (!waiter) return;
   terminalWaiters.delete(terminalId);
   if (activeTerminalId === terminalId) activeTerminalId = undefined;
-  let transcript: string | undefined;
-  try {
-    transcript = await editor.getBufferText(waiter.bufferId);
-  } catch {
-    // The terminal can be closed before its final buffer snapshot is available.
-  }
-  waiter.resolve(terminalProcessOutput(transcript, waiter.fallbackLines, exitCode));
+  waiter.resolve(
+    await captureTerminalProcessOutput(
+      (bufferId) => editor.getBufferText(bufferId),
+      waiter.bufferId,
+      waiter.fallbackLines,
+      exitCode,
+    ),
+  );
 }
 
-editor.on("lines_changed", (event) => invalidateDecorations(event.buffer_id));
-
-editor.on("after_file_save", (event) => {
+function sourceFileSaved(path: string, bufferId: number): void {
   discoveryCache.clear();
-  openBufferText.delete(pathKey(event.path));
-  const wasDirty = endDirtySourceSession(dirtySourcePaths, pathKey(event.path));
-  if (watchEnabled || settings.coverageOnSave) {
-    void guardedCall(() => runSavedFile(event.path));
-  } else if (wasDirty) {
-    void guardedCall(() => paintTestState(new Set([event.buffer_id])));
+  openBufferText.delete(pathKey(path));
+  const action = sourceSaveAction(
+    dirtySourcePaths,
+    pathKey(path),
+    bufferId,
+    watchEnabled || settings.coverageOnSave,
+  );
+  if (action.kind === "run") {
+    void guardedCall(() => runSavedFile(path));
+  } else if (action.kind === "repaint") {
+    void guardedCall(() => paintTestState(new Set([action.bufferId])));
   }
-});
+}
 
-editor.on("after_file_revert", (event) => {
+function sourceFileReverted(path: string, bufferId: number): void {
   discoveryCache.clear();
-  openBufferText.delete(pathKey(event.path));
-  endDirtySourceSession(dirtySourcePaths, pathKey(event.path));
-  invalidatedCoverageBuffers.delete(event.buffer_id);
+  openBufferText.delete(pathKey(path));
+  endDirtySourceSession(dirtySourcePaths, pathKey(path));
+  invalidatedCoverageBuffers.delete(bufferId);
   if (dockOpen && !controller.snapshot().busy) void guardedCall(refreshTests);
+}
+
+registerSourceLifecycleEvents((eventName, handler) => editor.on(eventName, handler), {
+  linesChanged: invalidateDecorations,
+  fileSaved: sourceFileSaved,
+  fileReverted: sourceFileReverted,
 });
 
 editor.on("after_file_explorer_change", () => {

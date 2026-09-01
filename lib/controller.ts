@@ -381,7 +381,15 @@ export class TestObservatoryController {
     this.tests = applyRunResults(this.tests, result.tests, adapter.id);
     if (result.output) this.outputs.push({ adapterId: adapter.id, text: result.output });
     if (result.diagnostics) this.diagnostics.push(...result.diagnostics);
-    if (result.exitCode !== 0 && result.tests.every((test) => test.status !== "failed")) {
+    const hasConclusiveResult = result.tests.some(
+      (test) => test.status === "passed" || test.status === "failed" || test.status === "skipped",
+    );
+    const parserResolvedUnknownExit = result.exitCode === -1 && hasConclusiveResult;
+    if (
+      result.exitCode !== 0 &&
+      result.tests.every((test) => test.status !== "failed") &&
+      !parserResolvedUnknownExit
+    ) {
       const message = this.text("controller.adapter_exit", {
         adapter: adapter.label,
         code: String(result.exitCode),

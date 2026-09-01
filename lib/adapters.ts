@@ -36,6 +36,7 @@ import {
 } from "./go.ts";
 import { applyRunResults, mergeDiscoveredTests } from "./model.ts";
 import { basename, dirname, isWithin, joinPath, resolvePath } from "./path.ts";
+import { mergeProcessExitCode } from "./runtime.ts";
 
 export function createBuiltInAdapters(): TestObservatoryAdapter[] {
   return [createDotnetAdapter(), createCargoAdapter(), createGoAdapter()];
@@ -135,7 +136,7 @@ function createDotnetAdapter(): TestObservatoryAdapter {
         const output = await context.execute(spec);
         const text = `${output.stdout}\n${output.stderr}`;
         combinedOutput += `${text}\n`;
-        exitCode = Math.max(exitCode, output.exitCode);
+        exitCode = mergeProcessExitCode(exitCode, output.exitCode);
         const trx = spec.reportPath ? context.readFile(spec.reportPath) : null;
         const parsed = trx ? parseTrx(trx, project) : parseDotnetConsoleResults(text, project);
         const enriched = applyRunResults(selected, alignDotnetResults(selected, parsed), "dotnet");
@@ -329,7 +330,7 @@ function createCargoAdapter(): TestObservatoryAdapter {
           const output = await context.execute(spec);
           const text = `${output.stdout}\n${output.stderr}`;
           combinedOutput += `${text}\n`;
-          if (exitCode === 0 && output.exitCode !== 0) exitCode = output.exitCode;
+          exitCode = mergeProcessExitCode(exitCode, output.exitCode);
           const requested = new Set(batch.map((test) => test.nativeId));
           const parsed = (
             nextestAvailable && !item.doctest ? parseNextestRun(text) : parseCargoRun(text)
@@ -449,7 +450,7 @@ function createGoAdapter(): TestObservatoryAdapter {
           );
           const text = `${output.stdout}\n${output.stderr}`;
           combinedOutput += `${text}\n`;
-          if (exitCode === 0 && output.exitCode !== 0) exitCode = output.exitCode;
+          exitCode = mergeProcessExitCode(exitCode, output.exitCode);
           const parsed = parseGoTestJson(text).map((test) =>
             alignGoFailureSource(module.root, batch, qualifyGoTest(test, module.root)),
           );
