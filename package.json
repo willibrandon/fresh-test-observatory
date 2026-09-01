@@ -1,0 +1,42 @@
+{
+  "$schema": "https://fresh-editor.dev/schemas/package.schema.json",
+  "name": "fresh-test-observatory",
+  "version": "0.1.0",
+  "description": "Test discovery, execution, failure navigation, and coverage for Fresh",
+  "type": "plugin",
+  "author": "Brandon Williams",
+  "license": "MIT",
+  "repository": "https://github.com/willibrandon/fresh-test-observatory",
+  "homepage": "https://willibrandon.github.io/fresh-test-observatory/",
+  "keywords": [
+    "fresh-editor",
+    "testing",
+    "dotnet",
+    "rust",
+    "golang",
+    "coverage",
+    "junit",
+    "cobertura"
+  ],
+  "fresh": {
+    "entry": "fresh-test-observatory.ts",
+    "min_version": "0.4.10",
+    "min_api_version": 2
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.mts",
+    "test:coverage": "node --test --experimental-test-coverage tests/*.test.mts",
+    "sync-types": "fresh --cmd script types && node scripts/sync-fresh-types.mjs",
+    "check-types": "node scripts/sync-fresh-types.mjs --check",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tests/tsconfig.json",
+    "check-plugin": "fresh --check-plugin fresh-test-observatory.ts",
+    "validate": "npm run format:check && npm run typecheck && npm test && npm run check-plugin"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "prettier": "^3.9.6",
+    "typescript": "^7.0.2"
+  }
+}

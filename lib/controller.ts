@@ -1,0 +1,448 @@
+import type {
+  AdapterContext,
+  AdapterRunResult,
+  CoverageFile,
+  RunRequest,
+  TestCase,
+  TestObservatoryAdapter,
+  TestScope,
+  TestSummary,
+} from "./contracts.ts";
+import {
+  applyRunResults,
+  markTests,
+  mergeCoverage,
+  mergeDiscoveredTests,
+  runPresentation,
+  selectTestsForScope,
+  summarizeTestsForIds,
+  type TestSelectionContext,
+  workspaceDiscoveryIsCurrent,
+} from "./model.ts";
+import { pathKey } from "./path.ts";
+
+export interface ObservatoryPort {
+  workspaceRoot(): string;
+  trustLevel(): string;
+  createContext(): AdapterContext;
+  progress(message: string): void;
+  changed(): void;
+  cancelActiveProcess(): Promise<boolean>;
+}
+
+export interface ObservatoryOutput {
+  adapterId: string;
+  text: string;
+}
+
+export interface ObservatorySnapshot {
+  tests: readonly TestCase[];
+  coverage: readonly CoverageFile[];
+  diagnostics: readonly string[];
+  outputs: readonly ObservatoryOutput[];
+  activeAdapterIds: ReadonlySet<string>;
+  busy: boolean;
+  cancelled: boolean;
+  progress: string;
+  discoveryRoot?: string;
+  summaryTestIds?: ReadonlySet<string>;
+  focusedTestId?: string;
+}
+
+/** The execution and registry state machine, isolated from Fresh's UI API. */
+export class TestObservatoryController {
+  private readonly port: ObservatoryPort;
+  private readonly adapters = new Map<string, TestObservatoryAdapter>();
+  private readonly activeAdapterIds = new Set<string>();
+  private readonly reportOnlyAdapterIds = new Set<string>();
+  private enabledAdapterIds: ReadonlySet<string> | undefined;
+  private tests: TestCase[] = [];
+  private coverage: CoverageFile[] = [];
+  private diagnostics: string[] = [];
+  private outputs: ObservatoryOutput[] = [];
+  private busy = false;
+  private cancelled = false;
+  private cancelRequested = false;
+  private progressMessage = "";
+  private discoveryRoot: string | undefined;
+  private summaryTestIds: ReadonlySet<string> | undefined;
+  private focusedTestId: string | undefined;
+
+  constructor(port: ObservatoryPort, initialAdapters: readonly TestObservatoryAdapter[] = []) {
+    this.port = port;
+    for (const adapter of initialAdapters) this.adapters.set(adapter.id, adapter);
+  }
+
+  snapshot(): ObservatorySnapshot {
+    return {
+      tests: this.tests,
+      coverage: this.coverage,
+      diagnostics: this.diagnostics,
+      outputs: this.outputs,
+      activeAdapterIds: this.activeAdapterIds,
+      busy: this.busy,
+      cancelled: this.cancelled,
+      progress: this.progressMessage,
+      ...(this.discoveryRoot ? { discoveryRoot: this.discoveryRoot } : {}),
+      ...(this.summaryTestIds ? { summaryTestIds: this.summaryTestIds } : {}),
+      ...(this.focusedTestId ? { focusedTestId: this.focusedTestId } : {}),
+    };
+  }
+
+  registerAdapter(adapter: TestObservatoryAdapter): boolean {
+    if (!validAdapter(adapter)) return false;
+    if (this.adapters.has(adapter.id)) this.removeAdapterState(adapter.id);
+    this.reportOnlyAdapterIds.delete(adapter.id);
+    this.adapters.set(adapter.id, adapter);
+    this.notify();
+    return true;
+  }
+
+  unregisterAdapter(id: string): boolean {
+    const removed = this.adapters.delete(id);
+    if (removed) {
+      this.removeAdapterState(id);
+      this.notify();
+    }
+    return removed;
+  }
+
+  listAdapters(): Array<{ id: string; label: string; priority: number }> {
+    return this.orderedAdapters().map((adapter) => ({
+      id: adapter.id,
+      label: adapter.label,
+      priority: adapter.priority ?? 0,
+    }));
+  }
+
+  /** Limits built-in and contributed adapters without unregistering their APIs. */
+  setEnabledAdapters(ids: readonly string[]): void {
+    this.enabledAdapterIds = ids.length > 0 ? new Set(ids) : undefined;
+    this.discoveryRoot = undefined;
+    this.notify();
+  }
+
+  ingestTests(adapterId: string, imported: readonly TestCase[]): number {
+    this.tests = applyRunResults(this.tests, imported);
+    if (!this.adapters.has(adapterId)) this.reportOnlyAdapterIds.add(adapterId);
+    this.summaryTestIds = new Set(imported.map((test) => test.id));
+    this.focusedTestId = imported.length === 1 ? imported[0]?.id : undefined;
+    this.notify();
+    return imported.length;
+  }
+
+  ingestCoverage(imported: readonly CoverageFile[]): number {
+    this.coverage = mergeCoverage([...this.coverage, ...imported]);
+    this.notify();
+    return this.coverage.length;
+  }
+
+  clearCoverage(): void {
+    this.coverage = [];
+    this.notify();
+  }
+
+  /** Removes stale coverage for one edited file while retaining other reports. */
+  invalidateCoveragePath(path: string): boolean {
+    const before = this.coverage.length;
+    this.coverage = this.coverage.filter((file) => pathKey(file.path) !== pathKey(path));
+    if (this.coverage.length === before) return false;
+    this.notify();
+    return true;
+  }
+
+  currentSummary(): TestSummary {
+    return summarizeTestsForIds(this.tests, this.summaryTestIds);
+  }
+
+  async refresh(): Promise<number> {
+    if (this.busy) return this.tests.length;
+    this.beginOperation("Discovering tests");
+    try {
+      const context = this.port.createContext();
+      const root = context.cwd;
+      const detected = new Set<string>();
+      const discovered: TestCase[] = [];
+      const enabled = this.orderedAdapters().filter((adapter) => this.isEnabled(adapter.id));
+      for (let index = 0; index < enabled.length; index += 1) {
+        const adapter = enabled[index]!;
+        if (this.cancelRequested) break;
+        try {
+          this.setProgress(`Detecting ${adapter.label} (${index + 1}/${enabled.length})`);
+          if (!(await adapter.detect(context))) continue;
+          detected.add(adapter.id);
+          this.setProgress(`Discovering ${adapter.label} tests (${index + 1}/${enabled.length})`);
+          const result = await adapter.discover(context);
+          discovered.push(...result.tests);
+          if (result.diagnostics) this.diagnostics.push(...result.diagnostics);
+        } catch (error) {
+          this.diagnostics.push(`${adapter.label}: ${errorMessage(error)}`);
+        }
+      }
+      if (pathKey(root) !== pathKey(this.port.workspaceRoot())) {
+        this.discoveryRoot = undefined;
+        this.activeAdapterIds.clear();
+        this.tests = [];
+        this.diagnostics = ["Workspace changed during test discovery; refresh again"];
+        return 0;
+      }
+      const previous = workspaceDiscoveryIsCurrent(this.discoveryRoot, root) ? this.tests : [];
+      const imported = this.tests.filter((test) => this.reportOnlyAdapterIds.has(test.adapterId));
+      this.tests = mergeDiscoveredTests(previous, [...discovered, ...imported]);
+      this.discoveryRoot = root;
+      this.activeAdapterIds.clear();
+      for (const id of detected) this.activeAdapterIds.add(id);
+      this.summaryTestIds = undefined;
+      this.focusedTestId = undefined;
+      return this.tests.length;
+    } finally {
+      this.endOperation();
+    }
+  }
+
+  async run(scope: TestScope, selectionContext: TestSelectionContext = {}): Promise<TestSummary> {
+    if (this.busy) return this.currentSummary();
+    if (
+      !workspaceDiscoveryIsCurrent(this.discoveryRoot, this.port.workspaceRoot()) &&
+      this.adapters.size > 0
+    ) {
+      await this.refresh();
+    }
+    if (!isTrustedWorkspace(this.port.trustLevel())) {
+      this.diagnostics = ["Trust this workspace to run tests"];
+      this.notify();
+      return this.currentSummary();
+    }
+    const selection = selectTestsForScope(this.tests, scope, selectionContext);
+    if (scope !== "workspace" && selection.length === 0) {
+      this.diagnostics = [emptySelectionMessage(scope)];
+      this.notify();
+      return this.currentSummary();
+    }
+    const presentation = runPresentation(scope, selection);
+    this.summaryTestIds = presentation.summaryTestIds;
+    this.focusedTestId = presentation.selectedTestId;
+    this.beginOperation(`Running ${selection.length} ${selection.length === 1 ? "test" : "tests"}`);
+    const runningIds = new Set(
+      selection
+        .filter(
+          (test) =>
+            this.activeAdapterIds.has(test.adapterId) &&
+            !this.reportOnlyAdapterIds.has(test.adapterId),
+        )
+        .map((test) => test.id),
+    );
+    this.tests = markTests(this.tests, runningIds, "running");
+    this.notify();
+    try {
+      const context = this.port.createContext();
+      const runnableAdapterIds = new Set(selection.map((test) => test.adapterId));
+      for (const adapterId of runnableAdapterIds) {
+        if (this.reportOnlyAdapterIds.has(adapterId) || !this.activeAdapterIds.has(adapterId)) {
+          this.diagnostics.push(
+            `Tests from the imported report '${adapterId}' cannot be rerun without a registered active adapter`,
+          );
+        }
+      }
+      const runnable = this.orderedAdapters().filter(
+        (adapter) => this.isEnabled(adapter.id) && this.activeAdapterIds.has(adapter.id),
+      );
+      for (let index = 0; index < runnable.length; index += 1) {
+        const adapter = runnable[index]!;
+        if (this.cancelRequested) break;
+        const adapterTests = selection.filter((test) => test.adapterId === adapter.id);
+        if (adapterTests.length === 0) continue;
+        this.setProgress(`Running ${adapter.label} (${index + 1}/${runnable.length})`);
+        const request = createRunRequest(scope, adapterTests, selectionContext);
+        try {
+          const result = await adapter.run(context, request);
+          this.applyAdapterResult(adapter, adapterTests, result);
+        } catch (error) {
+          const message = `${adapter.label}: ${errorMessage(error)}`;
+          this.diagnostics.push(message);
+          this.failTests(adapterTests, message);
+        }
+        this.notify();
+      }
+    } finally {
+      const stillRunning = new Set(
+        this.tests
+          .filter((test) => runningIds.has(test.id) && test.status === "running")
+          .map((test) => test.id),
+      );
+      this.tests = markTests(this.tests, stillRunning, "unknown");
+      this.cancelled = this.cancelRequested;
+      this.endOperation();
+    }
+    return this.currentSummary();
+  }
+
+  async collectCoverage(
+    selectionContext: TestSelectionContext = {},
+  ): Promise<readonly CoverageFile[]> {
+    if (this.busy) return this.coverage;
+    if (!isTrustedWorkspace(this.port.trustLevel())) {
+      this.diagnostics = ["Trust this workspace to collect coverage"];
+      this.notify();
+      return this.coverage;
+    }
+    const selection = selectTestsForScope(this.tests, "workspace", selectionContext);
+    this.beginOperation("Collecting coverage");
+    const files: CoverageFile[] = [];
+    try {
+      const context = this.port.createContext();
+      const coverageAdapters = this.orderedAdapters().filter(
+        (adapter) =>
+          this.isEnabled(adapter.id) &&
+          this.activeAdapterIds.has(adapter.id) &&
+          Boolean(adapter.collectCoverage),
+      );
+      for (let index = 0; index < coverageAdapters.length; index += 1) {
+        const adapter = coverageAdapters[index]!;
+        if (this.cancelRequested) break;
+        if (!adapter.collectCoverage) continue;
+        const adapterTests = selection.filter((test) => test.adapterId === adapter.id);
+        if (adapterTests.length === 0) continue;
+        this.setProgress(
+          `Collecting ${adapter.label} coverage (${index + 1}/${coverageAdapters.length})`,
+        );
+        try {
+          const result = await adapter.collectCoverage(
+            context,
+            createRunRequest("workspace", adapterTests, selectionContext),
+          );
+          files.push(...result.files);
+          if (result.output) this.outputs.push({ adapterId: adapter.id, text: result.output });
+          if (result.diagnostics) this.diagnostics.push(...result.diagnostics);
+        } catch (error) {
+          this.diagnostics.push(`${adapter.label}: ${errorMessage(error)}`);
+        }
+      }
+      this.coverage = mergeCoverage(files);
+      return this.coverage;
+    } finally {
+      this.cancelled = this.cancelRequested;
+      this.endOperation();
+    }
+  }
+
+  async stop(): Promise<boolean> {
+    if (!this.busy) return false;
+    this.cancelRequested = true;
+    this.setProgress("Stopping test run");
+    return this.port.cancelActiveProcess();
+  }
+
+  private applyAdapterResult(
+    adapter: TestObservatoryAdapter,
+    selection: readonly TestCase[],
+    result: AdapterRunResult,
+  ): void {
+    this.tests = applyRunResults(this.tests, result.tests, adapter.id);
+    if (result.output) this.outputs.push({ adapterId: adapter.id, text: result.output });
+    if (result.diagnostics) this.diagnostics.push(...result.diagnostics);
+    if (result.exitCode !== 0 && result.tests.every((test) => test.status !== "failed")) {
+      const message = `${adapter.label} exited ${result.exitCode}: ${firstUsefulLine(result.output)}`;
+      this.diagnostics.push(message);
+      this.failTests(selection, message);
+    }
+  }
+
+  private failTests(selection: readonly TestCase[], message: string): void {
+    const ids = new Set(selection.map((test) => test.id));
+    this.tests = this.tests.map((test) =>
+      ids.has(test.id) ? { ...test, status: "failed", message } : test,
+    );
+  }
+
+  private beginOperation(progress: string): void {
+    this.busy = true;
+    this.cancelled = false;
+    this.cancelRequested = false;
+    this.diagnostics = [];
+    this.outputs = [];
+    this.setProgress(progress);
+  }
+
+  private endOperation(): void {
+    this.busy = false;
+    this.progressMessage = "";
+    this.notify();
+  }
+
+  private setProgress(message: string): void {
+    this.progressMessage = message;
+    this.port.progress(message);
+    this.notify();
+  }
+
+  private notify(): void {
+    this.port.changed();
+  }
+
+  private removeAdapterState(id: string): void {
+    this.activeAdapterIds.delete(id);
+    this.tests = this.tests.filter((test) => test.adapterId !== id);
+    this.coverage = this.coverage.filter((file) => !file.path.includes(`/${id}/`));
+    this.discoveryRoot = undefined;
+  }
+
+  private orderedAdapters(): TestObservatoryAdapter[] {
+    return [...this.adapters.values()].sort(
+      (left, right) =>
+        (right.priority ?? 0) - (left.priority ?? 0) || left.id.localeCompare(right.id),
+    );
+  }
+
+  private isEnabled(id: string): boolean {
+    return this.enabledAdapterIds?.has(id) ?? true;
+  }
+}
+
+export function isTrustedWorkspace(level: string): boolean {
+  return level === "trusted";
+}
+
+function validAdapter(adapter: TestObservatoryAdapter): boolean {
+  return (
+    Boolean(adapter) &&
+    /^[a-z][a-z0-9-]*$/.test(adapter.id) &&
+    typeof adapter.detect === "function" &&
+    typeof adapter.discover === "function" &&
+    typeof adapter.run === "function"
+  );
+}
+
+function createRunRequest(
+  scope: TestScope,
+  tests: readonly TestCase[],
+  selection: TestSelectionContext,
+): RunRequest {
+  return {
+    scope,
+    tests: [...tests],
+    ...(selection.activeFile ? { activeFile: selection.activeFile } : {}),
+    ...(selection.activeLine !== undefined ? { activeLine: selection.activeLine } : {}),
+  };
+}
+
+function emptySelectionMessage(scope: TestScope): string {
+  return scope === "failed"
+    ? "There are no failed tests to rerun"
+    : scope === "selected"
+      ? "No test is selected"
+      : "No test was found for the current location";
+}
+
+function firstUsefulLine(output: string): string {
+  return (
+    output
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .find(Boolean) ?? "no diagnostic output"
+  );
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}

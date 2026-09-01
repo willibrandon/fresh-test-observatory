@@ -1,0 +1,8 @@
+node_modules/
+coverage/
+dist/
+types/fresh.d.ts
+REVIEW.md
+docs/assets/*.cast
+docs/assets/*.mp4
+docs/assets/*.webm

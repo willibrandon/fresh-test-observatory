@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Adapter API · Test Observatory</title>
+    <link rel="stylesheet" href="assets/site.css" />
+  </head>
+  <body>
+    <nav class="nav">
+      <div class="nav-inner">
+        <a class="brand" href="./"><span class="mark"></span>Test Observatory</a>
+        <div class="nav-links">
+          <a href="https://getfresh.dev">Fresh</a>
+          <a href="guide.html">Guide</a>
+          <a href="api.html">Adapter API</a>
+          <a href="https://github.com/willibrandon/fresh-test-observatory">GitHub</a>
+        </div>
+      </div>
+    </nav>
+    <main class="doc">
+      <h1>Adapter API</h1>
+      <p>
+        Language plugins can contribute discovery and result parsing while Test Observatory owns
+        execution state, filtering, navigation, persistence, and decorations. The exported API is
+        typed through Fresh's plugin registry.
+      </p>
+      <pre><code>const observatory = editor.getPluginApi("fresh-test-observatory");
+
+observatory?.registerAdapter({
+  id: "my-runner",
+  label: "My Runner",
+  priority: 50,
+  detect: (context) =&gt; context.readFile("my-runner.toml") !== null,
+  discover: async (context) =&gt; ({ tests: await discover(context) }),
+  run: async (context, request) =&gt; runAndParse(context, request),
+});</code></pre>
+
+      <h2>Adapter responsibilities</h2>
+      <p>
+        <code>detect</code> decides whether the adapter belongs in a workspace.
+        <code>discover</code> returns stable adapter-qualified test ids and optional source
+        locations. <code>run</code> receives an explicit scope and selected tests, then returns
+        parsed results, raw output, and an exit code. <code>collectCoverage</code> is optional and
+        returns normalized files with one-based line numbers.
+      </p>
+      <p>
+        Use <code>context.findFiles</code> instead of walking the workspace. Use
+        <code>context.execute</code> instead of spawning directly so trust, cancellation, progress,
+        report storage, and terminal mode remain consistent.
+      </p>
+
+      <h2>Report ingestion</h2>
+      <pre><code>observatory?.ingestJUnit(junitXml, "my-runner");
+observatory?.ingestCobertura(coberturaXml, editor.getCwd());</code></pre>
+      <p>
+        Replacing or unregistering an adapter removes its stale rows. Report-only rows remain
+        visible but do not pretend they can be rerun.
+      </p>
+    </main>
+    <footer><a href="guide.html">Back to the guide</a></footer>
+  </body>
+</html>

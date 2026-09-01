@@ -1,0 +1,8 @@
+[package]
+name = "observatory-rust-sample"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+path = "rust/src/lib.rs"
+

@@ -1,0 +1,29 @@
+# Local agent/test-generation working notes
+.testagent/
+
+# JavaScript tooling
+node_modules/
+coverage/
+dist/
+.artifacts/
+
+# Test Observatory reports
+.fresh-test-observatory/
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+coverage.cobertura.xml
+cover.out
+
+# .NET build output
+**/bin/
+**/obj/
+
+# Rust build output
+target/
+
+# Editor and OS state
+.DS_Store
+*.swp
+*.swo

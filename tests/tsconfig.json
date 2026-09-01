@@ -1,0 +1,8 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"]
+  },
+  "files": ["../types/fresh.d.ts", "../types/fresh-compat.d.ts"],
+  "include": ["../lib/**/*.ts", "./**/*.mts"]
+}
