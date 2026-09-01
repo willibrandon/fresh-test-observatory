@@ -163,6 +163,15 @@ test("package metadata uses live canonical URLs", () => {
   assert.equal(manifest.homepage, "https://github.com/willibrandon/fresh-test-observatory");
 });
 
+test("local installation removes stale and excluded package files", () => {
+  const installer = source("scripts/install-local.sh");
+
+  assert.match(installer, /--delete\s/);
+  assert.match(installer, /--delete-excluded\s/);
+  assert.match(installer, /--exclude 'REVIEW\.md'/);
+  assert.match(installer, /--exclude '\.testagent\/'/);
+});
+
 test("all controller and presentation translation keys exist in the locale file", () => {
   const locale = JSON.parse(source("fresh-test-observatory.i18n.json")) as {
     en: Record<string, string>;

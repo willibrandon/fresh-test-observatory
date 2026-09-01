@@ -7,6 +7,8 @@ install_root="$config_root/fresh/plugins/packages/fresh-test-observatory"
 
 mkdir -p "$install_root"
 rsync -a \
+  --delete \
+  --delete-excluded \
   --exclude '.git/' \
   --exclude '.testagent/' \
   --exclude 'REVIEW.md' \
