@@ -1,0 +1,26 @@
+:root {
+  --sl-color-accent-low: #10332f;
+  --sl-color-accent: #5fc8bd;
+  --sl-color-accent-high: #d2f3ee;
+}
+
+:root[data-theme="light"] {
+  --sl-color-accent-low: #d9f1ec;
+  --sl-color-accent: #0e6b64;
+  --sl-color-accent-high: #0f3532;
+}
+
+.sl-markdown-content
+  :not(h1, h2, h3, h4, h5, h6, .sl-heading-wrapper)
+  + .sl-heading-wrapper.level-h2 {
+  margin-top: 0.75em;
+}
+
+.sl-markdown-content :not(pre) > code {
+  overflow-wrap: anywhere;
+}
+
+.sl-markdown-content img {
+  border: 1px solid var(--sl-color-gray-5);
+  border-radius: 0.5rem;
+}

@@ -283,7 +283,7 @@ test("package metadata uses live canonical URLs", () => {
     manifest.$schema,
     "https://raw.githubusercontent.com/sinelaw/fresh/main/crates/fresh-editor/plugins/schemas/package.schema.json",
   );
-  assert.equal(manifest.homepage, "https://github.com/willibrandon/fresh-test-observatory");
+  assert.equal(manifest.homepage, "https://willibrandon.github.io/fresh-test-observatory/");
 });
 
 test("local installation removes stale and excluded package files", () => {

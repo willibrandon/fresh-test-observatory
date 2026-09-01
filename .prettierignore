@@ -6,3 +6,6 @@ REVIEW.md
 docs/assets/*.cast
 docs/assets/*.mp4
 docs/assets/*.webm
+docs-site/package-lock.json
+docs-site/**/*.astro
+docs-site/.astro/

@@ -27,3 +27,9 @@ target/
 .DS_Store
 *.swp
 *.swo
+
+# playwright cli
+.playwright-cli/
+
+# Astro docs site
+docs-site/.astro/

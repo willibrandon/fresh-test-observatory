@@ -1,0 +1,142 @@
+---
+import Default from "@astrojs/starlight/components/MarkdownContent.astro";
+---
+
+<docs-image-zoom>
+  <Default><slot /></Default>
+  <dialog aria-label="Expanded documentation image">
+    <div class="image-frame">
+      <button type="button" data-close>Close</button>
+      <img alt="" />
+      <p data-caption></p>
+    </div>
+  </dialog>
+</docs-image-zoom>
+
+<script>
+  class DocsImageZoom extends HTMLElement {
+    constructor() {
+      super();
+
+      const dialog = this.querySelector("dialog");
+      const expandedImage = dialog?.querySelector("img");
+      const caption = dialog?.querySelector<HTMLElement>("[data-caption]");
+      const closeButton = dialog?.querySelector<HTMLButtonElement>("[data-close]");
+
+      if (!dialog || !expandedImage || !caption || !closeButton) return;
+
+      const open = (image: HTMLImageElement) => {
+        expandedImage.src = image.src;
+        expandedImage.srcset = image.srcset;
+        expandedImage.sizes = "(max-width: 84rem) calc(100vw - 4rem), 80rem";
+        expandedImage.alt = image.alt;
+        caption.textContent = image.alt;
+        dialog.showModal();
+        document.documentElement.setAttribute("data-image-zoom-open", "");
+      };
+
+      const close = () => {
+        dialog.close();
+        document.documentElement.removeAttribute("data-image-zoom-open");
+      };
+
+      for (const image of this.querySelectorAll<HTMLImageElement>(".sl-markdown-content img")) {
+        image.dataset.imageZoom = "";
+        image.role = "button";
+        image.tabIndex = 0;
+        image.setAttribute("aria-haspopup", "dialog");
+        image.setAttribute("aria-label", `Enlarge ${image.alt || "image"}`);
+        image.addEventListener("click", () => open(image));
+        image.addEventListener("keydown", (event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            open(image);
+          }
+        });
+      }
+
+      closeButton.addEventListener("click", close);
+      dialog.addEventListener("close", () => {
+        document.documentElement.removeAttribute("data-image-zoom-open");
+      });
+      dialog.addEventListener("click", (event) => {
+        if (event.target === dialog) close();
+      });
+    }
+  }
+
+  if (!customElements.get("docs-image-zoom")) {
+    customElements.define("docs-image-zoom", DocsImageZoom);
+  }
+</script>
+
+<style>
+  docs-image-zoom {
+    display: contents;
+  }
+
+  :global(.sl-markdown-content img[data-image-zoom]) {
+    cursor: zoom-in;
+  }
+
+  :global(html[data-image-zoom-open]) {
+    overflow: hidden;
+  }
+
+  dialog {
+    box-sizing: border-box;
+    width: fit-content;
+    max-width: calc(100vw - 2rem);
+    max-height: calc(100vh - 2rem);
+    max-height: calc(100dvh - 2rem);
+    margin: auto;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.5rem;
+    padding: 0;
+    background: var(--sl-color-black);
+    color: var(--sl-color-gray-2);
+    overflow: hidden;
+  }
+
+  dialog::backdrop {
+    background: rgb(0 0 0 / 75%);
+  }
+
+  .image-frame {
+    box-sizing: border-box;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    gap: 0.75rem;
+    width: fit-content;
+    max-width: 100%;
+    max-height: calc(100vh - 2rem - 2px);
+    max-height: calc(100dvh - 2rem - 2px);
+    padding: 0.75rem;
+  }
+
+  button {
+    justify-self: end;
+    border: 1px solid var(--sl-color-gray-5);
+    border-radius: 0.25rem;
+    padding: 0.35rem 0.75rem;
+    background: var(--sl-color-gray-6);
+    color: var(--sl-color-white);
+    cursor: pointer;
+  }
+
+  img {
+    display: block;
+    width: auto;
+    max-width: min(80rem, calc(100vw - 4rem));
+    height: auto;
+    max-height: calc(100vh - 9rem);
+    max-height: calc(100dvh - 9rem);
+    margin: auto;
+    object-fit: contain;
+  }
+
+  p {
+    margin: 0;
+    font-size: var(--sl-text-sm);
+  }
+</style>

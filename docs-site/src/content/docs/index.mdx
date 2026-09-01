@@ -1,0 +1,38 @@
+---
+title: Test Observatory
+description: Test explorer plugin for the Fresh editor.
+---
+
+import { Image } from "astro:assets";
+import dark from "../../assets/run-all-dark.png";
+import light from "../../assets/run-all-light.png";
+
+A test explorer for the Fresh editor. It finds tests in .NET, Rust, and Go projects, runs them, and shows results, output, and coverage in a dock.
+
+<Image
+  src={dark}
+  alt="Fresh with a Rust file open and the Test Observatory dock below it listing cargo and .NET tests with their results"
+  class="light:sl-hidden"
+/>
+<Image
+  src={light}
+  alt="Fresh with a Rust file open and the Test Observatory dock below it listing cargo and .NET tests with their results"
+  class="dark:sl-hidden"
+/>
+
+## What it does
+
+- Finds tests by scanning source, then confirms them with each runner's own listing.
+- Runs the whole workspace, one file, the test nearest the cursor, the selected row, or the tests that failed last time.
+- Shows status, duration, location, message, and stack trace for each test, and keeps the full runner output.
+- Marks test lines in the gutter and puts failure messages beside them.
+- Collects coverage and shows it in the gutter, on the scrollbar, and in the file explorer.
+- Runs tests on save when watch is on.
+- Imports JUnit and Cobertura files from other tools.
+- Accepts adapters from other plugins for more ecosystems.
+
+## Where to go next
+
+- [Getting started](/fresh-test-observatory/getting-started/) covers install and the first run.
+- [Commands and keys](/fresh-test-observatory/commands-and-keys/) lists everything you can trigger.
+- [Ecosystems](/fresh-test-observatory/ecosystems/) explains what each adapter needs.
