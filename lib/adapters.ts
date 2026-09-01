@@ -43,7 +43,7 @@ import {
   parseGoTestJson,
 } from "./go.ts";
 import { applyRunResults, mergeDiscoveredTests } from "./model.ts";
-import { basename, dirname, isWithin, joinPath, pathKey, resolvePath, stem } from "./path.ts";
+import { basename, dirname, isWithin, joinPath, resolvePath } from "./path.ts";
 import { mergeProcessExitCode } from "./runtime.ts";
 
 export function createBuiltInAdapters(): TestObservatoryAdapter[] {
@@ -131,15 +131,13 @@ function createDotnetAdapter(): TestObservatoryAdapter {
       for (const project of pending) ok.add(project.path);
       return { ok, output: "" };
     }
-    const solution = pending.length > 1 ? await solutionPath(context) : undefined;
-    const targets = solution
-      ? [{ target: solution, projects: pending }]
-      : pending.map((project) => ({ target: project.path, projects: [project] }));
+    // Build exactly what `dotnet test` would: each test project and its
+    // references. A whole-solution build drags in unrelated projects, whose
+    // failures or outputs can break the test projects.
+    const targets = pending.map((project) => ({ target: project.path, projects: [project] }));
     let output = "";
     for (const item of targets) {
-      const label = solution
-        ? `Building ${stem(item.target)} (${item.projects.length} test projects)`
-        : `Building ${item.projects[0]!.name}`;
+      const label = `Building ${item.projects[0]!.name}`;
       context.progress?.(label);
       let result = await context.execute({
         ...buildDotnetBuildCommand(item.target, { label, noRestore: true }),
@@ -158,15 +156,6 @@ function createDotnetAdapter(): TestObservatoryAdapter {
       }
     }
     return { ok, output };
-  }
-
-  async function solutionPath(context: AdapterContext): Promise<string | undefined> {
-    const candidates = (
-      await Promise.all([context.findFiles("**/*.slnx"), context.findFiles("**/*.sln")])
-    )
-      .flat()
-      .filter((path) => pathKey(dirname(path)) === pathKey(context.cwd));
-    return candidates[0];
   }
 
   return {
@@ -259,7 +248,9 @@ function createDotnetAdapter(): TestObservatoryAdapter {
             tests = mergeWithSourceLocations(tests, listed, project.path);
             context.report?.({ tests: [...tests] });
           } else if (!context.cancelled?.()) {
-            diagnostics.push(`${project.name}: discovery command exited ${output.exitCode}`);
+            diagnostics.push(
+              `${project.name}: discovery command exited ${output.exitCode}: ${firstErrorLine(`${output.stdout}\n${output.stderr}`)}`,
+            );
           }
         }),
       );
@@ -358,6 +349,21 @@ function createDotnetAdapter(): TestObservatoryAdapter {
       };
     },
   };
+}
+
+/** The line a person would quote from a failed command: its first error, else its last line. */
+function firstErrorLine(text: string): string {
+  const lines = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const error =
+    lines.find((line) => /\berror\b(?!\s*output)|exception occurred|not found/i.test(line)) ??
+    lines.at(-1) ??
+    "no output";
+  // MSBuild prefixes errors with the file, line, and task; keep the message.
+  const message = error.replace(/^.*?:\s*(?=error\b)/i, "");
+  return message.length > 200 ? `${message.slice(0, 197)}...` : message;
 }
 
 function needsRestore(output: ProcessOutput): boolean {

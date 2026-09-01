@@ -722,6 +722,38 @@ public class CalculatorTests { [TestMethod] public void Adds() {} }`,
   assert.equal(discovered.tests.length, 1);
 });
 
+test(".NET adapter quotes the compiler error when discovery fails", async () => {
+  const files = {
+    "/repo/global.json": JSON.stringify({ test: { runner: "Microsoft.Testing.Platform" } }),
+    "/repo/tests/App.Tests.csproj": `<Project Sdk="MSTest.Sdk/4.0.2" />`,
+    "/repo/tests/CalculatorTests.cs": `namespace Demo.Tests;
+public class CalculatorTests { [TestMethod] public void Adds() {} }`,
+  };
+  const commands: ProcessSpec[] = [];
+  const fake = context(files, (spec) => {
+    commands.push(spec);
+    return {
+      stdout:
+        "CSC : error CS9057: Analyzer assembly '/repo/artifacts/bin/App.SourceGen.dll' cannot be used because it references version '5.9.0.0' of the compiler, which is newer than the currently running version '5.0.0.0'. [/repo/tests/App.Tests.csproj]\n",
+      stderr: "",
+      exitCode: 1,
+    };
+  });
+  const adapter = createBuiltInAdapters().find((item) => item.id === "dotnet")!;
+  const result = await adapter.discover(fake);
+  assert.deepEqual(
+    commands.map((spec) => spec.args[0]),
+    ["build", "test"],
+    "the listing still gets its own chance to build after a failed build",
+  );
+  assert.equal(result.tests.length, 1, "source-scanned tests still show");
+  assert.equal(result.diagnostics?.length, 1);
+  assert.match(
+    result.diagnostics![0]!,
+    /^App\.Tests: discovery command exited 1: error CS9057: Analyzer assembly/,
+  );
+});
+
 test(".NET adapter run stops between projects once Stop is pressed", async () => {
   const files = {
     "/repo/global.json": JSON.stringify({ test: { runner: "Microsoft.Testing.Platform" } }),
@@ -765,7 +797,7 @@ public class BTests { [TestMethod] public void Two() {} }`,
   assert.deepEqual(result.diagnostics ?? [], [], "a stopped run adds no noise diagnostics");
 });
 
-test(".NET adapter builds a root solution once when several projects need listing", async () => {
+test(".NET adapter builds each test project itself when several need listing", async () => {
   const files = {
     "/repo/App.slnx": "<Solution />",
     "/repo/a/A.Tests.csproj": `<Project Sdk="MSTest.Sdk/4.0.2" />`,
@@ -796,7 +828,8 @@ test(".NET adapter builds a root solution once when several projects need listin
   const discovered = await adapter.discover(fake);
   assert.deepEqual(
     commands.filter((spec) => spec.args[0] === "build").map((spec) => spec.args[1]),
-    ["/repo/App.slnx"],
+    ["/repo/a/A.Tests.csproj", "/repo/b/B.Tests.csproj"],
+    "each test project builds on its own, never the whole solution",
   );
   assert.equal(commands.filter((spec) => spec.args.includes("--list-tests")).length, 2);
   assert.deepEqual(
